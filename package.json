@@ -1,0 +1,11 @@
+{
+  "name": "bag-sandbox",
+  "private": true,
+  "scripts": {
+    "wasm": "wasm-pack build crates/bag-wasm --target web --release --out-dir ../../web/src/wasm",
+    "dev": "bun run wasm && cd web && bun run dev",
+    "build": "bun run wasm && cd web && bun run build",
+    "test": "cargo test --workspace",
+    "cli": "cargo run --release -p bag-cli --"
+  }
+}

@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en" class="h-full">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bag Studio</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+    <!-- Linked (not imported from JS) so it is render-blocking: no unstyled flash. -->
+    <link rel="stylesheet" href="/src/style.css" />
+    <!-- Inline so the loader is styled before any stylesheet arrives. -->
+    <style>
+      html, body { background: #0c0a09; margin: 0; }
+      #boot {
+        position: fixed; inset: 0; z-index: 50; display: grid; place-items: center;
+        background: #0c0a09; color: #a8a29e; font: 500 12px/1.4 Inter, system-ui, sans-serif;
+        transition: opacity .35s ease;
+      }
+      #boot.done { opacity: 0; pointer-events: none; }
+      #boot .box { display: grid; justify-items: center; gap: 14px; }
+      #boot .logo {
+        width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center;
+        background: rgba(217,162,95,.15); color: #d9a25f; font-size: 22px;
+        animation: boot-pulse 1.4s ease-in-out infinite;
+      }
+      #boot .title { color: #fafaf9; font-weight: 600; font-size: 14px; letter-spacing: -.01em; }
+      #boot .bar { width: 160px; height: 2px; border-radius: 2px; background: rgba(255,255,255,.08); overflow: hidden; }
+      #boot .bar::after {
+        content: ''; display: block; width: 40%; height: 100%; background: #d9a25f;
+        animation: boot-slide 1.1s ease-in-out infinite;
+      }
+      @keyframes boot-pulse { 50% { transform: scale(.92); opacity: .7; } }
+      @keyframes boot-slide { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+      @media (prefers-reduced-motion: reduce) { #boot .logo, #boot .bar::after { animation: none; } }
+    </style>
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body class="h-full bg-stone-950 font-sans text-stone-200 antialiased">
+    <div id="boot" role="status" aria-live="polite">
+      <div class="box">
+        <div class="logo">◐</div>
+        <div class="title">Bag Studio</div>
+        <div class="bar"></div>
+        <div id="boot-msg">loading engine…</div>
+      </div>
+    </div>
+    <div class="grid h-full grid-cols-[300px_1fr_360px] max-lg:grid-cols-[260px_1fr] max-md:grid-cols-1 max-md:grid-rows-[auto_60vh_auto]">
+      <!-- Left: design controls -->
+      <aside class="flex min-h-0 flex-col overflow-y-auto border-r border-white/5 bg-stone-900/60">
+        <header class="flex items-center gap-3 border-b border-white/5 px-4 py-4">
+          <div class="grid size-9 place-items-center rounded-lg bg-accent/15 text-lg text-accent">◐</div>
+          <div>
+            <div class="text-sm font-semibold tracking-tight text-stone-50">Bag Studio</div>
+            <div class="text-[11px] text-stone-500">parametric bag engine</div>
+          </div>
+        </header>
+        <div class="space-y-2.5 border-b border-white/5 px-4 py-3">
+          <label class="flex items-center justify-between gap-3 text-xs text-stone-400">
+            Style
+            <select id="style" class="input w-40">
+              <option value="tote">Tote</option>
+              <option disabled>Box / duffel (next)</option>
+              <option disabled>Bucket (next)</option>
+              <option disabled>Flap crossbody (next)</option>
+            </select>
+          </label>
+          <label class="flex items-center justify-between gap-3 text-xs text-stone-400">
+            Name
+            <input id="name" type="text" class="input w-40" />
+          </label>
+          <div class="flex gap-2 pt-1">
+            <button id="randomize" class="btn flex-1">🎲 Randomize</button>
+            <button id="reset" class="btn flex-1">Reset</button>
+          </div>
+        </div>
+        <div id="controls"></div>
+      </aside>
+
+      <!-- Center: 3D viewport -->
+      <main class="relative min-h-0">
+        <div id="viewport" class="absolute inset-0"></div>
+        <div class="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-xl border border-white/10 bg-stone-950/70 p-1.5 shadow-2xl backdrop-blur">
+          <button id="pt" class="btn" title="Progressive path tracing">✦ Ray trace</button>
+          <button id="seams" class="btn on">Stitches</button>
+          <button id="spin" class="btn">Turntable</button>
+          <button id="frame" class="btn">Reset view</button>
+          <button id="shot" class="btn">Screenshot</button>
+        </div>
+        <div id="status" class="absolute top-3 left-3 rounded-md bg-stone-950/60 px-2 py-1 font-mono text-[11px] text-stone-400 backdrop-blur empty:hidden"></div>
+      </main>
+
+      <!-- Right: pattern + exports -->
+      <aside class="flex min-h-0 flex-col border-l border-white/5 bg-stone-900/60 max-lg:col-span-2 max-md:col-span-1">
+        <div class="flex gap-1 border-b border-white/5 p-2">
+          <button data-tab="pattern" class="btn on flex-1">Pattern</button>
+          <button data-tab="info" class="btn flex-1">Cut list</button>
+        </div>
+        <div class="min-h-0 flex-1 overflow-y-auto p-3">
+          <div id="tab-pattern" class="tab"><div id="pattern"></div></div>
+          <div id="tab-info" class="tab hidden">
+            <div id="info" class="text-xs [&_span]:text-stone-500 [&_table]:w-full [&_td]:border-b [&_td]:border-white/5 [&_td]:py-2 [&_td]:align-top [&_td:last-child]:text-right [&_td:last-child]:text-accent"></div>
+          </div>
+        </div>
+        <div id="warnings" class="space-y-1 px-3 text-[11px] text-amber-400 empty:hidden"></div>
+        <div class="space-y-2 border-t border-white/5 p-3">
+          <div class="text-[10px] font-semibold tracking-widest text-stone-500 uppercase">Export pattern</div>
+          <div class="grid grid-cols-2 gap-1.5">
+            <button data-pdf="a4" class="btn btn-primary">PDF · A4 tiled</button>
+            <button data-pdf="letter" class="btn">PDF · Letter</button>
+            <button data-pdf="full" class="btn">PDF · Full size</button>
+            <button id="svg" class="btn">SVG</button>
+          </div>
+          <div class="pt-1 text-[10px] font-semibold tracking-widest text-stone-500 uppercase">Design &amp; model</div>
+          <div class="grid grid-cols-4 gap-1.5">
+            <button id="save" class="btn">Save</button>
+            <button id="load" class="btn">Load</button>
+            <button id="glb" class="btn">GLB</button>
+            <button id="obj" class="btn">OBJ</button>
+          </div>
+          <input id="file" type="file" accept=".json" hidden />
+        </div>
+      </aside>
+    </div>
+  </body>
+</html>

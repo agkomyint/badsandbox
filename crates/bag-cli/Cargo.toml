@@ -1,0 +1,13 @@
+[package]
+name = "bag-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "bag"
+path = "src/main.rs"
+
+[dependencies]
+bag-core = { path = "../bag-core" }
+clap = { version = "4", features = ["derive"] }
+serde_json.workspace = true

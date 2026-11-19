@@ -1,0 +1,40 @@
+{
+  "style": "tote",
+  "name": "Untitled tote",
+  "params": {
+    "corner_radius": 4.0,
+    "depth": 12.0,
+    "height": 38.0,
+    "hem": 3.0,
+    "lining": true,
+    "pocket": true,
+    "pocket_from_top": 9.0,
+    "pocket_height": 14.0,
+    "pocket_width": 18.0,
+    "seam_allowance": 1.0,
+    "softness": 1.6,
+    "strap_attach": 5.0,
+    "strap_length": 56.0,
+    "strap_spacing": 14.0,
+    "strap_width": 3.0,
+    "thickness": 0.25,
+    "top_width": 42.0,
+    "width": 36.0
+  },
+  "appearance": {
+    "lining": {
+      "color": "#7d2c26",
+      "finish": "canvas"
+    },
+    "outer": {
+      "color": "#cdbb9f",
+      "finish": "canvas"
+    },
+    "piping": true,
+    "strap": {
+      "color": "#6a3a1e",
+      "finish": "leather"
+    },
+    "thread": "#f1e7d4"
+  }
+}

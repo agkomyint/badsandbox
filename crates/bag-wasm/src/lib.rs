@@ -1,5 +1,8 @@
 //! Browser bindings. Everything goes in and out as JSON strings (PDF as bytes).
 
+mod cloth;
+pub use cloth::Cloth;
+
 use bag_core::{Paper, Output};
 use wasm_bindgen::prelude::*;
 

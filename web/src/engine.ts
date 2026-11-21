@@ -10,7 +10,13 @@ export type Part = {
 };
 export type Line = { kind: 'piping' | 'stitch'; radius: number; points: Float32Array };
 export type Mesh = { parts: Part[]; lines: Line[]; bounds: number[] };
-export type Piece = { id: string; name: string; cut: string; notes: string[] };
+export type V2 = { x: number; y: number };
+export type Notch = { at: V2; dir: V2; depth: number };
+export type Piece = {
+  id: string; name: string; cut: string; notes: string[];
+  sew: V2[]; cut_line: V2[]; folds: [V2, V2][]; notches: Notch[]; clips: Notch[];
+  grain: [V2, V2]; marks: V2[][]; labels: { at: V2; text: string; vertical: boolean }[];
+};
 export type Finish = 'canvas' | 'leather' | 'denim' | 'nylon' | 'suede';
 export type Surface = { finish: Finish; color: string };
 export type Metal = 'gold' | 'silver' | 'gunmetal' | 'black';

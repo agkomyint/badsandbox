@@ -11,28 +11,55 @@
 // All work is in the bag's local space (centimetres), driven by Studio.
 import * as THREE from 'three';
 import type { Finish } from './engine';
+import init, { Cloth } from './wasm/bag_wasm.js';
+
+/** The solver lives in Rust/WASM: await this once before creating a ClothSim. */
+export const clothReady = init();
 
 const SIM_PARTS = /^(front|back|gusset|strap_front|strap_back|shoulder_strap|pocket|lid|zip_panel)/;
 /** Zip-top tape + teeth: they ride on the lid edges (each half on its own side). */
 const ZIP_PARTS = /^zip_top_(tape|teeth)/;
 /** The slider + puller: slides along the zip line as you drag it. */
 const SLIDER_PARTS = /^zip_top_(slider|ring|tassel)/;
-const CLUSTER = 1.5; // cm: physics resolution (render mesh is skinned onto it)
+const STRAP_R = 2.6; // cm: handles stay this far from the panels
+const STRAP_CELL = 1.5; // handles need several particles across their width or they twist and crumple
+const CLUSTER = 3; // cm: physics resolution (render mesh is skinned onto it)
 const K = 4; // particles each render vertex follows
 const G = -981; // cm/s²
-const SUBSTEPS = 12;
+const SUBSTEPS = 14;
+const STEP = 1 / 60; // s: fixed solver step
 /** How far (cm) an opened zip top gapes. */
 const ZIP_GAPE = 6;
 const SELF_R =1.0; // cm: self-collision radius
 
-/** Bending compliance per finish: lower = stiffer. */
-const BEND: Record<Finish, number> = { leather: 2e-8, canvas: 6e-8, denim: 1e-7, suede: 4e-7, nylon: 2e-6 };
 /**
- * Body "structure" (lining + interfacing + seams holding the shape), as shape-matching
- * strength: 0 = collapses like a sack, 1 = rigid. Rotation-invariant, so the bag
- * still tips, swings and dents; it just wants to return to its sewn shape.
+ * Fabric as physics (XPBD compliance, cm/N-ish: smaller = stiffer). A bag stands up because
+ * its panels resist bending (cloth + lining + interfacing) and are held by seams: nothing
+ * pulls the shape back artificially. Bending is resisted by distance constraints between
+ * particles two (and for handles three) steps apart, so a leather strap behaves as a
+ * curved beam: stiff but not rigid, it sags and swings under load.
  */
-const STRUCTURE: Record<Finish, number> = { leather: 0.5, canvas: 0.3, denim: 0.25, suede: 0.2, nylon: 0.06 };
+/**
+ * How the bag is built, as in a real workshop. Each layer is physics, not a pose:
+ * - interfacing: 0 none, 1 fusible/woven, 2 foam. Stiffens the panels against bending.
+ * - base: a rigid base board (acrylic/corrugated plastic) in a sleeve inside the bottom.
+ * - rim: a stiffened top edge (piping cord or a wire) so the mouth keeps its opening.
+ */
+export type Construction = { interfacing: 0 | 1 | 2; base: boolean; rim: boolean };
+export const defaultConstruction = (f: Finish): Construction =>
+  ({ canvas: { interfacing: 1, base: true, rim: false }, leather: { interfacing: 1, base: true, rim: true },
+     denim: { interfacing: 1, base: true, rim: false }, suede: { interfacing: 1, base: true, rim: false },
+     nylon: { interfacing: 2, base: true, rim: true } } as Record<Finish, Construction>)[f];
+const INTERFACING = [1, 0.15, 0.03];
+
+type Material = { stretch: number; bend: number; damping: number; slide: number };
+const MATERIAL: Record<Finish, Material> = {
+  leather: { stretch: 2e-8, bend: 1e-6, damping: 4.5, slide: 0.35 },
+  canvas: { stretch: 3e-8, bend: 3e-6, damping: 4.0, slide: 0.25 },
+  denim: { stretch: 2e-8, bend: 5e-6, damping: 4.0, slide: 0.25 },
+  suede: { stretch: 6e-8, bend: 2e-5, damping: 3.5, slide: 0.3 },
+  nylon: { stretch: 1e-7, bend: 2e-4, damping: 2.5, slide: 0.15 },
+};
 const BODY_PARTS = /^(front|back|gusset|lid|zip_panel|pocket)/;
 
 const _m = new THREE.Matrix3();
@@ -40,10 +67,7 @@ const _c = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
 const _r = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
 const _t = new THREE.Vector3();
 const _dq = new THREE.Quaternion();
-/**
- * Rotation part of a 3x3 matrix (column-major array), warm-started from `q`
- * (Müller et al., "A Robust Method to Extract the Rotational Part of Deformations").
- */
+/** Rotation part of a 3x3 matrix (column-major array), warm-started from q (Mueller et al.). */
 function extractRotation(a: number[], q: THREE.Quaternion, iters = 10): THREE.Matrix3 {
   _c[0].set(a[0], a[1], a[2]); _c[1].set(a[3], a[4], a[5]); _c[2].set(a[6], a[7], a[8]);
   for (let it = 0; it < iters; it++) {
@@ -75,34 +99,32 @@ export interface ClothCollider {
 
 export class ClothSim {
   n = 0;
-  private x!: Float32Array; // position
-  private p!: Float32Array; // previous position
-  private v!: Float32Array; // velocity
-  private w!: Float32Array; // inverse mass
+  private core!: Cloth; // the Rust solver
+  x!: Float32Array; // position (live view into WASM memory)
+  w!: Float32Array; // inverse mass (live view)
   private x0!: Float32Array; // rest position
-  private ci!: Int32Array; // constraint particle pairs
-  private rest!: Float32Array;
-  private comp!: Float32Array;
   private bound: Bound[] = [];
+  private acc = 0; // leftover real time not yet simulated
   private grabbed = -1;
-  private grabW = 0;
+  private grabW = 1;
+  private mat: Material;
+  private strapMat: Material;
   private grabTarget = new THREE.Vector3();
   private calm = 0;
   private hashHead!: Int32Array;
   private hashNext!: Int32Array;
 
+  private isBody!: Uint8Array;
   private body!: Int32Array; // particles that keep the bag's shape (not straps)
-  private structure: number;
-  private q = new THREE.Quaternion();
-  private smw!: Float32Array; // per-particle shape-matching weight
+  private q = new THREE.Quaternion(); // best-fit pose of the body (only to map spots of the rest shape to now)
 
   items: ClothCollider | null = null;
 
   // Zipper: the lid halves are held together only by these links, each at a rest x.
   private side!: Int8Array; // -1 back half, +1 front half, 0 elsewhere
   private zip: { x0: number; x1: number; yMin: number } | null = null;
-  private zipA = new Int32Array(0);
-  private zipB = new Int32Array(0);
+  private zipA = new Uint32Array(0);
+  private zipB = new Uint32Array(0);
   private zipRest = new Float32Array(0);
   private zipX = new Float32Array(0);
   private zipLine: { a: number; b: number; x: number }[] = []; // sorted, for the slider
@@ -112,12 +134,17 @@ export class ClothSim {
   private zipping = false;
   private sliderRestX = 0;
 
-  constructor(private bag: THREE.Object3D, private floor: number, finish: Finish) {
-    this.structure = STRUCTURE[finish] ?? STRUCTURE.canvas;
-    this.build(BEND[finish] ?? BEND.canvas);
+  constructor(private bag: THREE.Object3D, private floor: number, finish: Finish, strapFinish: Finish = 'leather', private cons: Construction = defaultConstruction(finish)) {
+    const k = 1;
+    const sc = (m: Material): Material => ({ ...m, bend: m.bend * k });
+    this.mat = sc(MATERIAL[finish] ?? MATERIAL.canvas);
+    this.mat.bend *= INTERFACING[this.cons.interfacing];
+    this.strapMat = sc(MATERIAL[strapFinish] ?? MATERIAL.leather);
+    this.strapMat.bend *= 8; // soft leather: arches under its own weight, drapes when set down
+    this.build();
   }
 
-  private build(bendCompliance: number) {
+  private build() {
     const sim: THREE.Mesh[] = [], other: THREE.Mesh[] = [];
     this.bag.traverse((o) => {
       const m = o as THREE.Mesh;
@@ -133,10 +160,12 @@ export class ClothSim {
     const vmap: Int32Array[] = [];
     for (const m of sim) {
       const a = m.geometry.getAttribute('position') as THREE.BufferAttribute;
+      const strapMesh = !BODY_PARTS.test(m.name);
+      const C = strapMesh ? STRAP_CELL : CLUSTER;
       const map = new Int32Array(a.count);
       for (let i = 0; i < a.count; i++) {
         const x = a.getX(i), y = a.getY(i), z = a.getZ(i);
-        const k = `${Math.floor(x / CLUSTER)},${Math.floor(y / CLUSTER)},${Math.floor(z / CLUSTER)}`;
+        const k = `${strapMesh ? 's' : 'b'}${Math.floor(x / C)},${Math.floor(y / C)},${Math.floor(z / C)}`;
         let id = cell.get(k);
         if (id === undefined) {
           id = cnt.length;
@@ -154,13 +183,26 @@ export class ClothSim {
     const n = (this.n = cnt.length);
     const isBody = new Uint8Array(n);
     sim.forEach((m, mi) => { if (BODY_PARTS.test(m.name)) for (const id of vmap[mi]) isBody[id] = 1; });
+    this.isBody = isBody;
     this.body = Int32Array.from({ length: n }, (_, i) => i).filter((i) => isBody[i]);
-    this.x = Float32Array.from(pos);
-    this.x0 = this.x.slice();
-    this.p = this.x.slice();
-    this.v = new Float32Array(n * 3);
-    this.w = new Float32Array(n).fill(1);
-    this.smw = new Float32Array(n).fill(1);
+    // Handles are sewn on the outside of the panels and lean out a little: set down, they
+    // flop outward over the rim like soft leather, not into the mouth.
+    {
+      let yRim = -Infinity, yTop = -Infinity;
+      for (let i = 0; i < n; i++) { if (isBody[i]) yRim = Math.max(yRim, pos[i * 3 + 1]); }
+      for (let i = 0; i < n; i++) if (!isBody[i]) yTop = Math.max(yTop, pos[i * 3 + 1]);
+      for (let i = 0; i < n; i++) {
+        if (isBody[i] || pos[i * 3 + 1] <= yRim) continue;
+        const t = Math.min(1, (pos[i * 3 + 1] - yRim) / Math.max(1, yTop - yRim));
+        pos[i * 3 + 2] += (pos[i * 3 + 2] >= 0 ? 1 : -1) * 7 * t;
+      }
+    }
+    this.x0 = Float32Array.from(pos);
+    this.core = new Cloth(this.x0);
+    this.x = this.core.positions();
+    this.w = this.core.weights();
+    this.core.set_groups(Uint8Array.from(isBody, (b) => (b ? 0 : 1)));
+    const pos0 = this.x0; // (kept under the old name below)
 
     // Zipper halves: lid particles take the side of the zip line they sit on. The zip
     // runs along x at z = 0, which is also a voxel boundary, so no particle straddles it.
@@ -194,11 +236,16 @@ export class ClothSim {
       comp.push(c);
     };
     // Union-find for connected pieces (used for stitching pieces together).
+    const quads: number[] = []; // dihedral bending: edge a-b, opposite corners, compliance
+    const adj: Set<number>[] = Array.from({ length: n }, () => new Set<number>());
     const parent = Int32Array.from({ length: n }, (_, i) => i);
     const find = (i: number): number => { while (parent[i] !== i) i = parent[i] = parent[parent[i]]; return i; };
     sim.forEach((m, mi) => {
       const map = vmap[mi];
-      const bend = ZIP_PARTS.test(m.name) ? 0 : bendCompliance; // zipper: rigid in length and bend
+      const zipPart = ZIP_PARTS.test(m.name);
+      const bend = zipPart ? 0 : this.mat.bend; // zipper: rigid in length and bend
+      const strapPart = !BODY_PARTS.test(m.name);
+      const stretch = zipPart ? 0 : (strapPart ? this.strapMat : this.mat).stretch;
       const index = m.geometry.getIndex();
       if (!index) return;
       for (let t = 0; t + 2 < index.count; t += 3) {
@@ -206,12 +253,13 @@ export class ClothSim {
         if (tri[0] === tri[1] || tri[1] === tri[2] || tri[0] === tri[2]) continue;
         for (let e = 0; e < 3; e++) {
           const a = tri[e], b = tri[(e + 1) % 3], o = tri[(e + 2) % 3];
-          add(a, b, 0);
+          add(a, b, stretch);
+          adj[a].add(b); adj[b].add(a);
           parent[find(a)] = find(b);
           const k = a < b ? a * n + b : b * n + a;
           const prev = edges.get(k);
           if (prev === undefined) edges.set(k, o);
-          else if (prev !== o) add(prev, o, bend);
+          else if (prev !== o) quads.push(a, b, prev, o, strapPart ? this.strapMat.bend : bend);
         }
       }
     });
@@ -242,6 +290,41 @@ export class ClothSim {
         bodyIds.push(...c);
       }
     }
+    // 3a0. Handle stitching: strap particles that touch the body are sewn to the nearest body particle.
+    for (let i = 0; i < n; i++) {
+      if (isBody[i]) continue;
+      let best = -1, bd = 1.8 * 1.8;
+      for (const j of this.body) { const d = this.d2(i, j); if (d < bd) { bd = d; best = j; } }
+      if (best >= 0) add(i, best, 0);
+    }
+    // 3a. Base board: the bottom of the body is a rigid plate (distance links to every
+    //     neighbour within reach, zero compliance), the way a stiff insert behaves.
+    if (this.cons.base) {
+      const ids = [...this.body];
+      let yMin = Infinity;
+      for (const i of ids) yMin = Math.min(yMin, this.x0[i * 3 + 1]);
+      const base = ids.filter((i) => this.x0[i * 3 + 1] < yMin + 1.6);
+      const R2 = 5.5 * 5.5;
+      for (const i of base) {
+        const near: [number, number][] = [];
+        for (const j of base) if (j > i) { const d = this.d2(i, j); if (d < R2) near.push([d, j]); }
+        near.sort((a, b) => a[0] - b[0]);
+        for (const [, j] of near.slice(0, 14)) add(i, j, 0);
+      }
+    }
+    // 3a'. Rim: top edge of the body gets a stiff cord/wire (links 2-3 steps along it).
+    if (this.cons.rim) {
+      const ids = [...this.body];
+      let yMax = -Infinity;
+      for (const i of ids) yMax = Math.max(yMax, this.x0[i * 3 + 1]);
+      const rim = ids.filter((i) => this.x0[i * 3 + 1] > yMax - 1.0);
+      for (const i of rim) {
+        const near: [number, number][] = [];
+        for (const j of rim) if (j > i) { const d = this.d2(i, j); if (d < 6 * 6) near.push([d, j]); }
+        near.sort((a, b) => a[0] - b[0]);
+        for (const [, j] of near.slice(0, 4)) add(i, j, 2e-7);
+      }
+    }
     // 3b. Teeth links across the zip line, and stiff "spine" links along each edge so
     //     the zipper keeps its length (a zipper never stretches).
     if (this.zip) {
@@ -261,16 +344,20 @@ export class ClothSim {
         zx.push(inside ? mx : -1e9); // past the teeth the tape ends are sewn shut
         if (inside) this.zipLine.push({ a, b: best, x: mx });
       }
-      this.zipA = Int32Array.from(za); this.zipB = Int32Array.from(zb);
+      this.zipA = Uint32Array.from(za); this.zipB = Uint32Array.from(zb);
       this.zipRest = Float32Array.from(zr); this.zipX = Float32Array.from(zx);
       for (const e of [ef, eb]) for (let i = 0; i < e.length; i++) for (const s of [2, 3, 5]) if (i + s < e.length) add(e[i], e[i + s], 0);
     }
 
     const m = comp.length;
-    this.ci = Int32Array.from(pairs);
-    this.comp = Float32Array.from(comp);
-    this.rest = new Float32Array(m);
-    for (let k = 0; k < m; k++) this.rest[k] = Math.sqrt(this.d2(this.ci[k * 2], this.ci[k * 2 + 1]));
+    const rest = new Float32Array(m);
+    for (let k = 0; k < m; k++) rest[k] = Math.sqrt(this.d2(pairs[k * 2], pairs[k * 2 + 1], this.x0));
+    this.core.set_constraints(Uint32Array.from(pairs), rest, Float32Array.from(comp));
+    const qa = new Float32Array(quads.length / 5), qi = new Uint32Array(quads.length / 5 * 4);
+    for (let k = 0; k < qa.length; k++) { qi.set(quads.slice(k * 5, k * 5 + 4), k * 4); qa[k] = quads[k * 5 + 4]; }
+    this.core.set_bends(qi, qa);
+    if (this.zipA.length) this.core.set_zip(this.zipA, this.zipB, this.zipRest, this.zipX);
+    this.core.set_params(G, this.mat.damping, this.strapMat.damping * 1.5, this.floor, this.mat.slide, SELF_R, ZIP_GAPE);
 
     // 4. Skin every render vertex to its own cluster + nearby particles (inverse-distance
     //    weights), keeping the exact rest offset so the undeformed bag is unchanged.
@@ -395,7 +482,7 @@ export class ClothSim {
     if (!out.length) { out.push(this.nearest(x, y, z)); dist.push(Math.sqrt(this.d2p(out[0], x, y, z))); }
   }
 
-  private d2(i: number, j: number, x = this.x) {
+  private d2(i: number, j: number, x: Float32Array = this.x0) {
     const dx = x[i * 3] - x[j * 3], dy = x[i * 3 + 1] - x[j * 3 + 1], dz = x[i * 3 + 2] - x[j * 3 + 2];
     return dx * dx + dy * dy + dz * dz;
   }
@@ -538,97 +625,49 @@ export class ClothSim {
     return this.grabbed >= 0 || this.zipping;
   }
 
-  // ── Solver ─────────────────────────────────────────────────────────────────
+  // ── Solver (Rust/WASM core; this loop only sequences it and lets items push in between) ──
   /** Advance one frame. Returns true while the cloth is still moving. */
   step(frameDt: number): boolean {
-    const dt = Math.min(frameDt, 1 / 30) / SUBSTEPS;
-    const { x, p, v, w, ci, rest, comp, n } = this;
-    const m = rest.length;
-    const fy = this.floor + 0.12;
-    const g = this.grabbed;
-
-    // Zipper: the slider glides toward where it's pulled; lid fabric behind an open
-    // zipper stops holding its sewn shape and is free to flop open.
+    // Fixed timestep: XPBD stiffness depends on dt, so a changing frame time makes the cloth
+    // jitter. Whatever the frame rate, the solver always advances in identical 1/60 s steps.
+    this.acc = Math.min(this.acc + Math.min(frameDt, 0.1), 3 * STEP);
+    const SUBS: number = (globalThis as any).__SUBS ?? SUBSTEPS, SN: number = (globalThis as any).__SN ?? 7, IN: number = (globalThis as any).__IN ?? 2;
+    const dt = STEP / SUBS;
+    const core = this.core, g = this.grabbed;
+    core.set_bend((globalThis as any).__BI ?? 4, (globalThis as any).__BR ?? 0.5);
     const zipMoving = Math.abs(this.zipTarget - this.zipS) > 1e-4;
-    if (this.zip) {
-      this.zipS += (this.zipTarget - this.zipS) * Math.min(1, frameDt * 14);
-      const from = this.openFrom;
-      for (const id of this.lidIds) this.smw[id] = Math.max(0, Math.min(1, (from - this.x0[id * 3]) / 3));
+    if (this.zip) this.zipS += (this.zipTarget - this.zipS) * Math.min(1, frameDt * 14);
+    core.set_zip_open(this.openFrom);
+    const t = this.grabTarget;
+    let stepped = 0;
+    while (this.acc >= STEP) {
+    this.acc -= STEP;
+    stepped++;
+    for (let s = 0; s < SUBS; s++) {
+      core.set_grab(g, t.x, t.y, t.z);
+      core.predict(dt);
+      core.solve(dt);
+      this.refresh();
+      if (s % IN === 0) this.items?.collide(this.x, this.w, this.n, dt);
+      core.floor_contact();
+      core.self_collide(s % 6 === 0);
+      if (s % SN === SN - 1) core.strap_collide(STRAP_R);
+      core.finish(dt);
     }
-    const { zipA, zipB, zipRest, zipX } = this;
-    const zl = zipA.length, open = this.openFrom;
-
-    for (let s = 0; s < SUBSTEPS; s++) {
-      for (let i = 0; i < n; i++) {
-        const i3 = i * 3;
-        p[i3] = x[i3]; p[i3 + 1] = x[i3 + 1]; p[i3 + 2] = x[i3 + 2];
-        if (w[i] === 0) continue;
-        v[i3 + 1] += G * dt;
-        x[i3] += v[i3] * dt; x[i3 + 1] += v[i3 + 1] * dt; x[i3 + 2] += v[i3 + 2] * dt;
-      }
-      if (g >= 0) {
-        // Ease the held point toward the cursor so fast flicks don't explode the cloth.
-        const t = this.grabTarget, k = 0.35;
-        x[g * 3] += (t.x - x[g * 3]) * k; x[g * 3 + 1] += (t.y - x[g * 3 + 1]) * k; x[g * 3 + 2] += (t.z - x[g * 3 + 2]) * k;
-      }
-      const dt2 = dt * dt;
-      for (let k = 0; k < m; k++) {
-        const a = ci[k * 2], b = ci[k * 2 + 1];
-        const wa = w[a], wb = w[b];
-        const ws = wa + wb + comp[k] / dt2;
-        if (ws === 0) continue;
-        const a3 = a * 3, b3 = b * 3;
-        const dx = x[a3] - x[b3], dy = x[a3 + 1] - x[b3 + 1], dz = x[a3 + 2] - x[b3 + 2];
-        const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        if (len < 1e-9) continue;
-        const corr = (len - rest[k]) / (len * ws);
-        x[a3] -= dx * corr * wa; x[a3 + 1] -= dy * corr * wa; x[a3 + 2] -= dz * corr * wa;
-        x[b3] += dx * corr * wb; x[b3 + 1] += dy * corr * wb; x[b3 + 2] += dz * corr * wb;
-      }
-      // Closed teeth: rigid links across the zip line.
-      // Open teeth: the two halves spring apart (a real zip top gapes once opened),
-      // most strongly a few cm behind the slider.
-      for (let k = 0; k < zl; k++) {
-        const a = zipA[k], b = zipB[k], wa = w[a], wb = w[b], ws = wa + wb;
-        if (!ws) continue;
-        const a3 = a * 3, b3 = b * 3;
-        const dx = x[a3] - x[b3], dy = x[a3 + 1] - x[b3 + 1], dz = x[a3 + 2] - x[b3 + 2];
-        const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        if (len < 1e-9) continue;
-        let corr: number;
-        if (zipX[k] >= open) {
-          if (zipX[k] > 1e8) continue;
-          const gape = zipRest[k] + ZIP_GAPE * Math.min(1, (zipX[k] - open) / 4);
-          if (len >= gape) continue;
-          corr = ((len - gape) / (len * ws)) * 0.08; // soft: the fabric, not a rod
-        } else corr = (len - zipRest[k]) / (len * ws);
-        x[a3] -= dx * corr * wa; x[a3 + 1] -= dy * corr * wa; x[a3 + 2] -= dz * corr * wa;
-        x[b3] += dx * corr * wb; x[b3 + 1] += dy * corr * wb; x[b3 + 2] += dz * corr * wb;
-      }
-      this.items?.collide(x, w, n, dt);
-      // Floor with friction: a particle that touches down loses most of its sliding.
-      for (let i = 0; i < n; i++) {
-        const i3 = i * 3;
-        if (x[i3 + 1] < fy) {
-          x[i3 + 1] = fy;
-          x[i3] = p[i3] + (x[i3] - p[i3]) * 0.2;
-          x[i3 + 2] = p[i3 + 2] + (x[i3 + 2] - p[i3 + 2]) * 0.2;
-        }
-      }
-      this.shapeMatch(1 - Math.pow(1 - this.structure, 1 / SUBSTEPS) * 1);
-      if (s % 6 === 0) this.findSelfPairs();
-      this.selfCollide();
-      const damp = 1 - 0.6 * dt;
-      for (let i = 0; i < n * 3; i++) v[i] = ((x[i] - p[i]) / dt) * damp;
     }
-    // Normals are the costly part of the mesh update; every other frame is invisible to the eye.
+    if (!stepped) return true; // no solver step due this frame (display faster than 60 Hz)
+    this.refresh();
+    this.fitPose();
     this.frameNo++;
     this.writeMeshes(this.frameNo % 2 === 0);
-
-    let maxV = 0;
-    for (let i = 0; i < n * 3; i++) maxV = Math.max(maxV, Math.abs(v[i]));
-    this.calm = maxV < 2 ? this.calm + frameDt : 0; // < 2 cm/s for a while = settled
+    const [rms, max] = core.speeds();
+    this.calm = rms < 1.2 && max < 10 ? this.calm + frameDt : 0;
     return g >= 0 || zipMoving || this.calm < 0.4;
+  }
+  /** Re-fetch the live views (WASM memory can move if it ever grows). */
+  private refresh() {
+    this.x = this.core.positions();
+    this.w = this.core.weights();
   }
 
   /** Zip line midpoint at rest x `px`, from the current (or rest) particle positions. */
@@ -647,98 +686,30 @@ export class ClothSim {
   }
 
   /**
-   * Shape matching (Müller et al. 2005): find the best rotation + translation of the
-   * rest shape onto the current body particles, and pull each one toward it by `k`.
+   * Best-fit rigid pose of the body (Müller et al. 2005, used only for reading the pose):
+   * maps a spot of the rest shape to where it is now. It does not move any particle.
    */
-  private shapeMatch(k: number) {
+  private fitPose() {
     const ids = this.body;
-    if (k <= 0 || ids.length < 4) return;
-    const { x, x0, w, smw } = this;
-    // Weighted by smw: fabric that has been let go (an opened lid) must not steer
-    // the body's best-fit rotation, or a gaping lid tips the whole bag over.
-    let cx = 0, cy = 0, cz = 0, rx = 0, ry = 0, rz = 0, m = 0;
+    if (ids.length < 4) return;
+    const { x, x0 } = this;
+    let cx = 0, cy = 0, cz = 0, rx = 0, ry = 0, rz = 0;
     for (const i of ids) {
-      const s = smw[i];
-      cx += x[i * 3] * s; cy += x[i * 3 + 1] * s; cz += x[i * 3 + 2] * s;
-      rx += x0[i * 3] * s; ry += x0[i * 3 + 1] * s; rz += x0[i * 3 + 2] * s; m += s;
+      cx += x[i * 3]; cy += x[i * 3 + 1]; cz += x[i * 3 + 2];
+      rx += x0[i * 3]; ry += x0[i * 3 + 1]; rz += x0[i * 3 + 2];
     }
-    if (m < 1) return;
+    const m = ids.length;
     cx /= m; cy /= m; cz /= m; rx /= m; ry /= m; rz /= m;
     this.fitC.set(cx, cy, cz); this.fitC0.set(rx, ry, rz);
-    // A = Σ s (x - c)(x0 - c0)^T, column-major in a Matrix3.
     const a = [0, 0, 0, 0, 0, 0, 0, 0, 0];
     for (const i of ids) {
-      const s = smw[i];
-      if (!s) continue;
-      const px = (x[i * 3] - cx) * s, py = (x[i * 3 + 1] - cy) * s, pz = (x[i * 3 + 2] - cz) * s;
+      const px = x[i * 3] - cx, py = x[i * 3 + 1] - cy, pz = x[i * 3 + 2] - cz;
       const qx = x0[i * 3] - rx, qy = x0[i * 3 + 1] - ry, qz = x0[i * 3 + 2] - rz;
       a[0] += px * qx; a[3] += px * qy; a[6] += px * qz;
       a[1] += py * qx; a[4] += py * qy; a[7] += py * qz;
       a[2] += pz * qx; a[5] += pz * qy; a[8] += pz * qz;
     }
-    const R = extractRotation(a, this.q);
-    const e = R.elements;
-    for (const i of ids) {
-      if (w[i] === 0 || smw[i] === 0) continue;
-      const ki = k * smw[i];
-      const qx = x0[i * 3] - rx, qy = x0[i * 3 + 1] - ry, qz = x0[i * 3 + 2] - rz;
-      const gx = e[0] * qx + e[3] * qy + e[6] * qz + cx;
-      const gy = e[1] * qx + e[4] * qy + e[7] * qz + cy;
-      const gz = e[2] * qx + e[5] * qy + e[8] * qz + cz;
-      x[i * 3] += (gx - x[i * 3]) * ki; x[i * 3 + 1] += (gy - x[i * 3 + 1]) * ki; x[i * 3 + 2] += (gz - x[i * 3 + 2]) * ki;
-    }
-  }
-
-  /** Candidate self-collision pairs (flat i,j list), refreshed every few substeps. */
-  private selfPairs = new Int32Array(1024);
-  private selfCount = 0;
-
-  /**
-   * Find particle pairs that are near each other now but weren't neighbours in the
-   * rest shape. The spatial hash is the costly part, so this runs every few substeps
-   * with a generous search radius; `selfCollide` then resolves the pairs every substep.
-   * (Resolving only every few substeps made the cloth buzz: each catch-up push
-   * became a velocity spike.)
-   */
-  private findSelfPairs() {
-    const { x, x0, n } = this;
-    const reach = SELF_R * 2.5, reach2 = reach * reach, rest2 = (SELF_R * 2.5) ** 2;
-    this.buildHash(x, reach);
-    const s = this.cellSize;
-    let cnt = 0, pairs = this.selfPairs;
-    for (let i = 0; i < n; i++) {
-      const i3 = i * 3;
-      const cx = Math.floor(x[i3] / s), cy = Math.floor(x[i3 + 1] / s), cz = Math.floor(x[i3 + 2] / s);
-      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++)
-        for (let j = this.hashHead[this.hash(cx + a, cy + b, cz + c)]; j >= 0; j = this.hashNext[j]) {
-          if (j <= i) continue;
-          const j3 = j * 3;
-          const dx = x[i3] - x[j3], dy = x[i3 + 1] - x[j3 + 1], dz = x[i3 + 2] - x[j3 + 2];
-          if (dx * dx + dy * dy + dz * dz >= reach2) continue;
-          const ex = x0[i3] - x0[j3], ey = x0[i3 + 1] - x0[j3 + 1], ez = x0[i3 + 2] - x0[j3 + 2];
-          if (ex * ex + ey * ey + ez * ez < rest2) continue; // neighbours in the rest shape
-          if (cnt + 2 > pairs.length) { const g = new Int32Array(pairs.length * 2); g.set(pairs); pairs = this.selfPairs = g; }
-          pairs[cnt++] = i; pairs[cnt++] = j;
-        }
-    }
-    this.selfCount = cnt;
-  }
-
-  /** Push apart candidate pairs that got closer than SELF_R. */
-  private selfCollide() {
-    const { x, w, selfPairs: pairs, selfCount: cnt } = this;
-    const r = SELF_R, r2 = r * r;
-    for (let k = 0; k < cnt; k += 2) {
-      const i = pairs[k], j = pairs[k + 1], i3 = i * 3, j3 = j * 3;
-      const dx = x[i3] - x[j3], dy = x[i3 + 1] - x[j3 + 1], dz = x[i3 + 2] - x[j3 + 2];
-      const d2 = dx * dx + dy * dy + dz * dz;
-      if (d2 >= r2 || d2 < 1e-12) continue;
-      const ws = w[i] + w[j];
-      if (!ws) continue;
-      const d = Math.sqrt(d2), corr = (r - d) / (d * ws);
-      x[i3] += dx * corr * w[i]; x[i3 + 1] += dy * corr * w[i]; x[i3 + 2] += dz * corr * w[i];
-      x[j3] -= dx * corr * w[j]; x[j3 + 1] -= dy * corr * w[j]; x[j3 + 2] -= dz * corr * w[j];
-    }
+    extractRotation(a, this.q);
   }
 
   private frameNo = 0;

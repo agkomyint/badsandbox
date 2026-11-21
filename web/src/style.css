@@ -40,10 +40,68 @@ input[type='number']::-webkit-inner-spin-button {
   @apply appearance-none;
 }
 
-/* Pattern preview */
-#pattern svg {
-  @apply h-auto w-full rounded-md bg-white shadow-lg;
-}
 #viewport canvas {
   @apply block size-full;
 }
+
+/* ── Interactive 2D pattern ─────────────────────────────────────────────── */
+.pv { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; user-select: none; background: #0f0d0c; border-radius: 8px; --u: 0.1; }
+.pv.panning { cursor: grabbing; }
+.pv .gl { fill: none; stroke: rgba(255,255,255,.04); stroke-width: calc(var(--u) * 1px); }
+.pv .gm { fill: none; stroke: rgba(255,255,255,.09); stroke-width: calc(var(--u) * 1px); }
+.pv .pc { cursor: pointer; }
+.pv .fill { fill: color-mix(in srgb, var(--c) 16%, transparent); stroke: none; transition: fill .12s; }
+.pv .cut { fill: none; stroke: #e7e5e4; stroke-width: calc(var(--u) * 1.4px); stroke-linejoin: round; pointer-events: none; }
+.pv .sew { fill: none; stroke: #a8a29e; stroke-width: calc(var(--u) * 1px); stroke-dasharray: calc(var(--u) * 5px) calc(var(--u) * 3px); pointer-events: none; }
+.pv .fold { fill: none; stroke: #78716c; stroke-width: calc(var(--u) * 1px); stroke-dasharray: calc(var(--u) * 10px) calc(var(--u) * 3px) calc(var(--u) * 2px) calc(var(--u) * 3px); pointer-events: none; }
+.pv .mark { fill: none; stroke: #60a5fa; stroke-width: calc(var(--u) * 1.2px); stroke-dasharray: calc(var(--u) * 3px) calc(var(--u) * 3px); pointer-events: none; }
+.pv .notch { fill: none; stroke: #f5f5f4; stroke-width: calc(var(--u) * 1.6px); pointer-events: none; }
+.pv .grain { fill: none; stroke: #a8a29e; stroke-width: calc(var(--u) * 1px); stroke-linejoin: round; pointer-events: none; }
+.pv text { font-family: Inter, system-ui, sans-serif; pointer-events: none; fill: #a8a29e; }
+.pv .lbl { font-size: calc(var(--u) * 10px); fill: #78716c; text-anchor: middle; }
+.pv .nm { font-size: calc(var(--u) * 11px); font-weight: 600; fill: #d6d3d1; }
+.pv .ct { font-weight: 400; fill: #78716c; }
+.pv .dims path { fill: none; stroke: #d9a25f; stroke-width: calc(var(--u) * 1px); }
+.pv .dims text { font-size: calc(var(--u) * 11px); fill: #d9a25f; font-weight: 600; }
+.pv .pc.hov .fill { fill: color-mix(in srgb, var(--c) 38%, transparent); }
+.pv .pc.hov .cut, .pv .pc.sel .cut { stroke: #d9a25f; stroke-width: calc(var(--u) * 2.2px); }
+.pv .pc.sel .fill { fill: color-mix(in srgb, var(--c) 50%, transparent); }
+.pv.has-sel .pc:not(.sel):not(.hov) { opacity: .45; }
+.pv .pc.sel .sew { stroke: #fafaf9; }
+
+/* ── Layout: params | 2D pattern | 3D ─────────────────────────────────────── */
+#shell { grid-template-columns: 300px var(--right, 460px) minmax(0, 1fr); transition: grid-template-columns .2s ease; }
+#shell.resizing { transition: none; }
+#shell.collapsed { grid-template-columns: 48px var(--right, 460px) minmax(0, 1fr); }
+@media (max-width: 1023px) {
+  #shell { grid-template-columns: 260px minmax(0, 1fr); }
+  #shell.collapsed { grid-template-columns: 48px minmax(0, 1fr); }
+  #shell > main { order: 2; } #shell > #right { order: 3; border-right: 0; }
+}
+@media (max-width: 767px) { #shell, #shell.collapsed { grid-template-columns: 1fr; } }
+#shell.collapsed #left > :not(header) { display: none; }
+#shell.collapsed #left { overflow: hidden; }
+#shell.collapsed #left header { flex-direction: column; padding: 10px 6px; gap: 10px; }
+#shell.collapsed #left header .brand { display: none; }
+@media (max-width: 767px) { #shell.collapsed #left header { flex-direction: row; } #shell.collapsed #left header .brand { display: block; } }
+
+/* Draggable divider between the pattern panel and the 3D view */
+#splitter { position: absolute; right: -4px; top: 0; bottom: 0; width: 9px; cursor: col-resize; z-index: 20; touch-action: none; }
+#splitter::after { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 1px; background: transparent; transition: background .15s; }
+#splitter:hover::after, #splitter.active::after, #splitter:focus-visible::after { width: 3px; left: 3px; background: var(--color-accent); }
+@media (max-width: 1023px) { #splitter { display: none; } }
+
+/* Drag handles in the 2D pattern */
+.pv .hd { cursor: grab; }
+.pv .hd circle { r: calc(var(--u) * 5px);}
+.pv .hd .halo { r: calc(var(--u) * 11px); }
+.pv .hd circle { fill: #d9a25f; stroke: #0f0d0c; stroke-width: calc(var(--u) * 2px); }
+.pv .hd .halo { fill: rgba(217,162,95,.18); stroke: none; }
+.pv .hd:hover circle:not(.halo), .pv .hd.on circle:not(.halo) { fill: #fff; }
+.pv .hd text { font-size: calc(var(--u) * 10px); fill: #d9a25f; font-weight: 600; paint-order: stroke; stroke: #0f0d0c; stroke-width: calc(var(--u) * 3px); }
+
+/* ring that follows the zipper pull while simulating */
+.pull-hint { position: absolute; width: 34px; height: 34px; margin: -17px 0 0 -17px; border-radius: 50%;
+  border: 2px solid #e8a85a; pointer-events: none; z-index: 5; box-shadow: 0 0 10px #e8a85a99;
+  animation: pull-pulse 1.4s ease-in-out infinite; }
+@keyframes pull-pulse { 0%,100% { transform: scale(0.8); opacity: 0.95 } 50% { transform: scale(1.25); opacity: 0.4 } }

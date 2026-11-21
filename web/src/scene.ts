@@ -16,9 +16,11 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import type { Appearance, Finish, Line, Mesh } from './engine';
 import { makeMaterial, metalMaterial, plainMaterial, threadMaterial } from './materials';
-import { ClothSim } from './fabric';
+import { ClothSim, clothReady } from './fabric';
 import { Items, ITEMS } from './items';
+import { packSlot, WALL } from './fit';
 
+export type EditHandle = { key: string; axis: "x" | "y" | "z"; at: [number, number, number]; gain: number; label: string };
 const CM = 0.01; // engine works in cm, scene in metres
 const SETTLE_MS = 180; // idle time before AO kicks back in
 type Surf = 'outer' | 'lining' | 'strap' | 'trim';
@@ -166,6 +168,8 @@ function buildStitches(lines: Line[]): THREE.BufferGeometry | null {
   return g;
 }
 
+const pushBack = (m: any) => { m.polygonOffset = true; m.polygonOffsetFactor = 10; m.polygonOffsetUnits = 10; return m; };
+
 export class Studio {
   renderer: THREE.WebGLRenderer;
   scene = new THREE.Scene();
@@ -173,22 +177,28 @@ export class Studio {
   controls: OrbitControls;
   composer: EffectComposer;
   bag = new THREE.Group();
-  /** Physics moves this; `bag` sits inside it with its bottom at y = 0. */
+  /** `bag` sits inside this with its bottom at y = 0. */
   rig = new THREE.Group();
   onSamples: (n: number) => void = () => {};
-  onPhysics: (state: 'moving' | 'settled') => void = () => {};
+  onMotion: (state: 'moving' | 'settled') => void = () => {};
   /** Fired when a click on the zipper pull opens (true) or closes (false) the zip. */
   onZipToggle?: (open: boolean) => void;
   pathTracing = false;
 
-  private physics: import('./physics').Physics | null = null;
-  private physicsOn = false;
   private cloth: ClothSim | null = null;
   private clothOn = false;
   private items: Items | null = null;
   private moving = false;
   private lastT = performance.now();
+  private stage!: THREE.Mesh;
   private ray = new THREE.Raycaster();
+  /** Draggable dimension handles on the bag (scaled like the bag, but outside it so exports stay clean). */
+  private hgroup = new THREE.Group();
+  private hmeshes: THREE.Mesh[] = [];
+  private hdef: EditHandle[] = [];
+  private hhot = -1;
+  /** Dragged a handle: delta in cm along its axis (times gain). phase start/move/end. */
+  onEdit: (key: string, delta: number, phase: "start" | "move" | "end", label: string) => void = () => {};
   private dragPlane = new THREE.Plane();
 
   private ao: GTAOPass;
@@ -211,7 +221,7 @@ export class Studio {
   private ptTimer = 0;
 
   constructor(private el: HTMLElement) {
-    const r = (this.renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' }));
+    const r = (this.renderer = new THREE.WebGLRenderer({ antialias: false }));
     r.setPixelRatio(Math.min(devicePixelRatio, 1.5));
     r.toneMapping = THREE.AgXToneMapping;
     r.toneMappingExposure = 1.1;
@@ -224,7 +234,7 @@ export class Studio {
     this.camera.position.set(0.9, 0.65, 1.35);
     const c = (this.controls = new OrbitControls(this.camera, r.domElement));
     c.enableDamping = true;
-    c.maxPolarAngle = Math.PI * 0.495;
+    c.maxPolarAngle = Math.PI; // free orbit: you can look at the underside
     c.minDistance = 0.25;
     c.maxDistance = 5;
     c.autoRotateSpeed = 1.2;
@@ -250,16 +260,21 @@ export class Studio {
     this.scene.add(rim);
     this.scene.add(new THREE.HemisphereLight('#ffffff', '#b9ae9f', 0.35));
 
-    const stage = new THREE.Mesh(cyclorama(), new THREE.MeshStandardMaterial({ color: '#e4e0da', roughness: 0.95 }));
+    const stage = this.stage = new THREE.Mesh(cyclorama(), new THREE.MeshStandardMaterial({ color: '#e4e0da', roughness: 0.95 }));
     stage.receiveShadow = true;
     this.rig.add(this.bag);
     this.scene.add(stage, this.rig);
     this.initPointer(r.domElement);
+    this.initHandles(r.domElement);
     this.bag.scale.setScalar(CM);
+    this.hgroup.scale.setScalar(CM);
+    this.rig.add(this.hgroup);
+
+    // Lining sits a hair behind the outer layer: no speckle where the two touch while the cloth moves.
 
     this.mats = {
       outer: makeMaterial('canvas', '#cdbb9f'),
-      lining: makeMaterial('canvas', '#7d2c26'),
+      lining: pushBack(makeMaterial('canvas', '#7d2c26')),
       strap: makeMaterial('leather', '#6a3a1e'),
       trim: makeMaterial('leather', '#6a3a1e'),
       metal: metalMaterial('gold'),
@@ -319,18 +334,92 @@ export class Studio {
     this.invalidate();
   }
 
+  private fitGroup?: THREE.Group;
+  /** Ghost boxes for the fit check (cm, bag-centred, y from the bag's bottom). */
+  showFit(boxes: { c: [number, number, number]; size: [number, number, number]; color: string; ok: boolean }[] | null) {
+    if (this.fitGroup) {
+      this.rig.remove(this.fitGroup);
+      this.fitGroup.traverse((o) => { const m = o as THREE.Mesh; if (m.geometry) m.geometry.dispose(); const mt = m.material as THREE.Material | undefined; if (mt) mt.dispose(); });
+      this.fitGroup = undefined;
+    }
+    if (boxes && boxes.length) {
+      const g = new THREE.Group();
+      for (const b of boxes) {
+        const geo = new THREE.BoxGeometry(...b.size);
+        const m = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: b.color, roughness: 0.5, transparent: true, opacity: b.ok ? 0.85 : 0.55, depthWrite: b.ok }));
+        m.position.set(...b.c);
+        const e = new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color: b.ok ? '#ffffff' : '#ff8a7a' }));
+        m.add(e); g.add(m);
+      }
+      g.scale.copy(this.bag.scale); g.position.copy(this.bag.position);
+      this.fitGroup = g; this.rig.add(g);
+    }
+    this.fitOn = !!(boxes && boxes.length);
+    this.updateGhost();
+    this.dirty = true;
+  }
+  private fitOn = false;
+  /** See-through bag while checking a fit or while it holds things, so the contents show. */
+  private updateGhost() {
+    const on = this.fitOn || (this.clothOn && (this.items?.count ?? 0) > 0);
+    this.bag.traverse((o) => {
+      const m = o as THREE.Mesh; const mt = m.material as THREE.Material | THREE.Material[] | undefined;
+      if (!m.isMesh || !mt || Array.isArray(mt)) return;
+      const u = m.userData;
+      if (on) {
+        if (u.fitOrig === undefined) u.fitOrig = { t: mt.transparent, o: mt.opacity, d: mt.depthWrite };
+        mt.transparent = true; mt.opacity = Math.min(u.fitOrig.o, 0.3); mt.depthWrite = false;
+      } else if (u.fitOrig) { mt.transparent = u.fitOrig.t; mt.opacity = u.fitOrig.o; mt.depthWrite = u.fitOrig.d; u.fitOrig = undefined; }
+      mt.needsUpdate = true;
+    });
+    this.dirty = true;
+  }
+  private emitItems() { this.updateGhost(); this.onItems(); }
+  get bagBottom() { return this.lastMesh ? this.lastMesh.bounds[1] : 0; }
+  private pullHint?: HTMLDivElement;
+  private pullX = NaN;
+  private pullY = NaN;
+  /** A pulsing ring that follows the zipper pull while the simulation runs, so it is easy to find. */
+  private updatePullHint() {
+    const el = this.el;
+    if (!this.pullHint) {
+      const d = document.createElement('div');
+      d.className = 'pull-hint';
+      d.style.display = 'none';
+      el.appendChild(d);
+      this.pullHint = d;
+    }
+    const h = this.pullHint;
+    let pull: THREE.Mesh | null = null;
+    if (this.clothOn && this.hasZip) this.bag.traverse((m) => { if (!pull && /^zip_top_slider/.test(m.name) && (m as THREE.Mesh).geometry) pull = m as THREE.Mesh; });
+    if (!pull) { if (h.style.display !== 'none') h.style.display = 'none'; return; }
+    const g = (pull as THREE.Mesh).geometry;
+    g.computeBoundingBox();
+    const c = (pull as THREE.Mesh).localToWorld(g.boundingBox!.getCenter(new THREE.Vector3())).project(this.camera);
+    const r = el.getBoundingClientRect();
+    const show = c.z < 1 ? 'block' : 'none';
+    if (h.style.display !== show) h.style.display = show;
+    const tx = Math.round((c.x + 1) / 2 * r.width), ty = Math.round((1 - c.y) / 2 * r.height);
+    if (tx !== this.pullX || ty !== this.pullY) { this.pullX = tx; this.pullY = ty; h.style.left = `${tx}px`; h.style.top = `${ty}px`; }
+  }
+
   private frame() {
     const now = performance.now();
     const dt = (now - this.lastT) / 1000;
     this.lastT = now;
     this.controls.update();
-    const sim = this.clothOn ? this.cloth : this.physicsOn ? this.physics : null;
+    this.sizeHandles();
+    this.updatePullHint();
+    const under = this.camera.position.y < 0.01; // below the floor: hide it so the base is visible
+    if (this.stage.visible === under) { this.stage.visible = !under; this.shadowDirty = true; this.dirty = true; }
+    const sim = this.clothOn ? this.cloth : null;
     if (sim) {
       let moving = sim.step(dt);
       if (this.clothOn && this.items?.count) {
         const g = this.items.group;
         g.position.copy(this.bag.position);
         g.scale.copy(this.bag.scale);
+        this.syncBasket();
         moving = this.items.step(dt) || moving;
       }
       if (moving) {
@@ -339,7 +428,7 @@ export class Studio {
       }
       if (moving !== this.moving) {
         this.moving = moving;
-        this.onPhysics(moving ? 'moving' : 'settled');
+        this.onMotion(moving ? 'moving' : 'settled');
         // Path tracing can't keep up with motion: raster while moving, re-trace once settled.
         if (!moving && this.pathTracing) this.pt?.setScene(this.scene, this.camera);
       }
@@ -362,6 +451,127 @@ export class Studio {
       this.shadowDirty = false;
     }
     this.composer.render();
+  }
+
+  private hlNames: string[] = [];
+  private hlMat = new THREE.MeshBasicMaterial({
+    color: 0xd9a25f, transparent: true, opacity: 0.55, depthWrite: false, side: THREE.DoubleSide,
+    polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+  });
+  private hlMeshes: THREE.Mesh[] = [];
+
+  /** Tint the 3D parts with these names (null/empty clears). Overlays share geometry, so they follow the sim. */
+  highlight(names: string[] | null) {
+    this.hlNames = names ?? [];
+    for (const o of this.hlMeshes) o.parent?.remove(o);
+    this.hlMeshes = [];
+    for (const n of this.hlNames) {
+      const m = this.meshes.get(n);
+      if (!m) continue;
+      const o = new THREE.Mesh(m.geometry, this.hlMat);
+      o.name = '__hl';
+      o.raycast = () => {};
+      o.renderOrder = 2;
+      m.add(o);
+      this.hlMeshes.push(o);
+    }
+  }
+
+  /** Name of the bag part under a screen point, or null. */
+  /** Replace the on-bag drag handles (bag-local cm). Hidden while simulating or ray tracing. */
+  setEditHandles(list: EditHandle[]) {
+    this.hdef = list;
+    while (this.hmeshes.length < list.length) {
+      const m = new THREE.Mesh(
+        new THREE.SphereGeometry(1, 16, 12),
+        new THREE.MeshBasicMaterial({ color: 0xf59e0b, depthTest: false, transparent: true, opacity: 1, toneMapped: false }),
+      );
+      m.renderOrder = 999;
+      this.hmeshes.push(m);
+      this.hgroup.add(m);
+    }
+    this.hmeshes.forEach((m, i) => {
+      m.visible = i < list.length;
+      if (list[i]) m.position.set(...list[i].at);
+    });
+    this.updateHandleVisibility();
+    this.invalidate();
+  }
+  private updateHandleVisibility() {
+    this.hgroup.visible = !this.clothOn && !this.pathTracing && this.hdef.length > 0;
+  }
+  private sizeHandles() {
+    if (!this.hgroup.visible) return;
+    const w = new THREE.Vector3();
+    this.hmeshes.forEach((m, i) => {
+      m.getWorldPosition(w);
+      const k = (w.distanceTo(this.camera.position) * 0.011) / CM;
+      m.scale.setScalar(i === this.hhot ? k * 1.35 : k);
+      (m.material as THREE.MeshBasicMaterial).color.set(i === this.hhot ? 0xffffff : 0xf59e0b);
+    });
+  }
+  private initHandles(el: HTMLElement) {
+    const ndc = new THREE.Vector2();
+    const aim = (e: PointerEvent) => {
+      const r = el.getBoundingClientRect();
+      ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+      this.ray.setFromCamera(ndc, this.camera);
+    };
+    const hitIndex = () => {
+      if (!this.hgroup.visible) return -1;
+      const live = this.hmeshes.slice(0, this.hdef.length);
+      const h = this.ray.intersectObjects(live, false)[0];
+      return h ? live.indexOf(h.object as THREE.Mesh) : -1;
+    };
+    let drag: { i: number; start: THREE.Vector3; plane: THREE.Plane } | null = null;
+    const p = new THREE.Vector3();
+    el.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      aim(e);
+      const i = hitIndex();
+      if (i < 0) return;
+      e.stopImmediatePropagation();
+      const w = this.hmeshes[i].getWorldPosition(new THREE.Vector3());
+      const axis = this.hdef[i].axis;
+      const n = axis === "z" ? new THREE.Vector3(0, 1, 0) : this.camera.getWorldDirection(new THREE.Vector3()).setY(0).normalize();
+      const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(n, w);
+      if (!this.ray.ray.intersectPlane(plane, p)) return;
+      drag = { i, start: p.clone(), plane };
+      this.controls.enabled = false;
+      el.setPointerCapture(e.pointerId);
+      el.style.cursor = "grabbing";
+      this.onEdit(this.hdef[i].key, 0, "start", this.hdef[i].label);
+    }, { capture: true });
+    el.addEventListener("pointermove", (e) => {
+      aim(e);
+      if (!drag) {
+        const i = hitIndex();
+        if (i !== this.hhot) { this.hhot = i; el.style.cursor = i >= 0 ? "grab" : ""; this.invalidate(); }
+        return;
+      }
+      if (!this.ray.ray.intersectPlane(drag.plane, p)) return;
+      const h = this.hdef[drag.i];
+      this.onEdit(h.key, ((p[h.axis] - drag.start[h.axis]) / CM) * h.gain, "move", h.label);
+    });
+    const up = (e: PointerEvent) => {
+      if (!drag) return;
+      const h = this.hdef[drag.i];
+      drag = null;
+      this.controls.enabled = true;
+      el.releasePointerCapture?.(e.pointerId);
+      el.style.cursor = "";
+      this.onEdit(h.key, 0, "end", h.label);
+    };
+    el.addEventListener("pointerup", up);
+    el.addEventListener("pointercancel", up);
+  }
+
+  pick(clientX: number, clientY: number): string | null {
+    const r = this.el.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
+    this.ray.setFromCamera(ndc, this.camera);
+    const hit = this.ray.intersectObjects([...this.meshes.values()], false)[0];
+    return hit ? hit.object.name : null;
   }
 
   private slotOf(material: string): Slot {
@@ -415,9 +625,10 @@ export class Studio {
     this.stitches.geometry.dispose();
     this.stitches.geometry = buildStitches(mesh.lines) ?? new THREE.BufferGeometry();
 
+    this.highlight(this.hlNames);
     this.bag.position.y = -mesh.bounds[1] * CM;
+    this.hgroup.position.copy(this.bag.position);
     this.lastMesh = mesh;
-    this.physics?.setShape(this.bag);
     if (this.clothOn) this.startCloth();
     if (!this.framed) {
       this.framed = true;
@@ -454,7 +665,7 @@ export class Studio {
       const s = app[slot];
       if (!s) continue;
       if (this.finish[slot] !== s.finish) {
-        swap(slot, makeMaterial(s.finish, s.color));
+        swap(slot, slot === "lining" ? pushBack(makeMaterial(s.finish, s.color)) : makeMaterial(s.finish, s.color));
         this.finish[slot] = s.finish;
         if (slot === 'outer') {
           const oldP = this.mats.piping;
@@ -495,29 +706,10 @@ export class Studio {
     this.invalidate(true);
   }
 
-  /** Gravity + floor + mouse pick-up. Turning it on drops the bag from a little height. */
-  async setPhysics(on: boolean) {
-    if (on && !this.physics) {
-      const { Physics } = await import('./physics');
-      this.physics = await Physics.create(this.rig);
-      this.physics.setShape(this.bag);
-    }
-    this.physicsOn = on;
-    if (!this.physics) return;
-    if (on) this.physics.reset(0.25);
-    else {
-      this.physics.reset(0);
-      this.moving = false;
-      this.onPhysics('settled');
-      if (this.pathTracing) this.pt?.setScene(this.scene, this.camera);
-    }
-    this.shadowDirty = true;
-    this.invalidate(true);
-  }
-
   /** Soft-body fabric simulation: the bag slumps, drapes and can be lifted by any point. */
   setSimulation(on: boolean) {
     this.clothOn = on;
+    this.updateHandleVisibility();
     if (on) {
       this.rig.position.set(0, 0, 0);
       this.rig.quaternion.identity();
@@ -526,8 +718,11 @@ export class Studio {
       this.cloth?.restore();
       this.cloth = null;
       this.items?.clear();
+      this.items?.clearBasket();
+      this.basket = null;
+      this.emitItems();
       this.moving = false;
-      this.onPhysics('settled');
+      this.onMotion('settled');
       if (this.pathTracing) this.pt?.setScene(this.scene, this.camera);
     }
     this.shadowDirty = true;
@@ -539,13 +734,16 @@ export class Studio {
     return this.cloth?.n ?? 0;
   }
 
-  private startCloth() {
+  private async startCloth() {
+    await clothReady;
+    if (!this.clothOn) return;
     const floor = this.lastMesh ? this.lastMesh.bounds[1] : 0;
     this.cloth = new ClothSim(this.bag, floor, this.finish.outer);
     this.cloth.items = this.items;
     this.items?.setFloor(floor);
+    if (this.items?.count) { const keys = this.items.list().map((x) => x.key); this.items.clear(); for (const k of keys) this.place(k); this.syncBasket(); this.emitItems(); }
     this.moving = true;
-    this.onPhysics('moving');
+    this.onMotion('moving');
   }
 
   /** True if the simulated bag has a zip top you can open. */
@@ -563,84 +761,109 @@ export class Studio {
     this.invalidate(true);
   }
 
-  /** Drop an item into (or onto) the bag. Simulation only. */
+  /** Called whenever the bag's contents change (add, remove, re-pack, clear). */
+  onItems: () => void = () => {};
+  /** Bag measurements from the design, for the inside volume. */
+  bagDims?: { width: number; top_width: number };
+
+  /** The usable inside of the bag in its rest frame (cm): where items may be placed. */
+  private basketVolume() {
+    const cloth = this.cloth!, b = this.lastMesh!.bounds;
+    const bb = cloth.bodyBox();
+    const [z0, z1] = cloth.bodyDepth(b[1] - 1, b[1] + 3);
+    const xc = (bb[0] + bb[3]) / 2, zc = (z0 + z1) / 2;
+    const bw = this.bagDims ? Math.min(this.bagDims.width, this.bagDims.top_width) : bb[3] - bb[0];
+    const iw = Math.max(1, bw - 2 * WALL), id = Math.max(1, z1 - z0 - 2 * WALL);
+    const lo: [number, number, number] = [xc - iw / 2, b[1] + WALL, zc - id / 2];
+    const hi: [number, number, number] = [xc + iw / 2, bb[4] - 1.5, zc + id / 2];
+    return { lo, hi };
+  }
+  private basket: { lo: [number, number, number]; hi: [number, number, number] } | null = null;
+
+  /** Put the basket's walls where the bag's inside is right now. */
+  private syncBasket() {
+    if (!this.cloth || !this.items || !this.basket) return;
+    const { lo, hi } = this.basket;
+    const half: [number, number, number] = [(hi[0] - lo[0]) / 2 + 0.3, (hi[1] - lo[1]) / 2, (hi[2] - lo[2]) / 2 + 0.3];
+    const c = this.cloth.toCurrent(new THREE.Vector3((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2));
+    this.items.setBasket(c, this.cloth.fitQ, half, this.cloth.hasZip && this.cloth.zipper > 0.5);
+  }
+
+  /** Place an item in the first free spot of the bag, already in position: no dropping. -1 = bag full, -2 = too big. */
+  private place(key: string): number {
+    const spec = ITEMS[key], items = this.items, cloth = this.cloth;
+    if (!spec || !items || !cloth || !this.lastMesh) return 0;
+    this.basket = this.basketVolume();
+    const vol = this.basket, placed = items.slots();
+    const all = Items.orientations(spec);
+    const tall = Math.max(...all.map((o) => o.ext[1]));
+    const tries = spec.upright ? [all.filter((o) => o.ext[1] >= tall - 1e-6), all] : [all];
+    let r = null as ReturnType<typeof packSlot>, set = all;
+    for (const t of tries) { set = t; r = packSlot(vol, placed, t.map((o) => o.ext), spec.mass); if (r) break; }
+    if (!r) return packSlot(vol, [], all.map((o) => o.ext), spec.mass) ? -1 : -2;
+    const o = set[r.oi];
+    const mid = new THREE.Vector3((r.lo[0] + r.hi[0]) / 2, (r.lo[1] + r.hi[1]) / 2, (r.lo[2] + r.hi[2]) / 2);
+    const q = o.q.clone().premultiply(cloth.fitQ);
+    items.add(key, cloth.toCurrent(mid), q, { lo: r.lo, hi: r.hi });
+    return items.count;
+  }
+
   async addItem(key: string) {
     if (!this.cloth || !this.lastMesh) return 0;
-    const b = this.lastMesh.bounds; // [minX, minY, minZ, maxX, maxY, maxZ] in cm
     if (!this.items) {
-      this.items = await Items.create(b[1]);
+      this.items = await Items.create(this.lastMesh.bounds[1]);
       this.rig.add(this.items.group);
     }
     if (!this.cloth) return 0; // turned off while Rapier was loading
     this.cloth.items = this.items;
-    const spec = ITEMS[key];
-    // The way in: an open zip, or the whole top of a bag without one.
-    let zs = this.cloth.zipSpan;
-    if (zs && this.cloth.zipper > 0.5) zs = null; // zipped shut: it lands on top
-    else if (!zs) { const bb = this.cloth.bodyBox(); zs = { x0: bb[0] + 1.5, x1: bb[3] - 1.5, y: bb[4] }; }
-    if (zs && spec) {
-      // Pack it the way people do: long side along the zip, lying flat on the
-      // bottom if it fits across the gusset, else standing on its long edge. Standing
-      // things upright looked nice but they lean on a wall and lever a soft bag over.
-      const [a, bb, c] = spec.size;
-      // Depth where it'll lie: at the bottom (gussets often taper toward it).
-      const [z0, z1] = this.cloth.bodyDepth(b[1] - 1, b[1] + 3);
-      const zipLen = zs.x1 - zs.x0, depth = z1 - z0, zc = (z0 + z1) / 2;
-      const Z = new THREE.Vector3(0, 0, 1), X = new THREE.Vector3(1, 0, 0);
-      const q = new THREE.Quaternion();
-      let hx: number, hy: number;
-      if (spec.kind === 'box') {
-        const long = Math.max(a, bb), wide = Math.min(a, bb);
-        if (bb > a) q.setFromAxisAngle(Z, Math.PI / 2); // model's long axis (y) → x
-        if (2 * long > zipLen - 1) { q.identity(); hx = a; hy = bb; } // too long: upright
-        else if (2 * wide <= depth + 0.5) { q.premultiply(new THREE.Quaternion().setFromAxisAngle(X, Math.PI / 2)); hx = long; hy = c; }
-        else { hx = long; hy = wide; }
-        // A tall flat thing standing in a narrow bag leans on a wall and levers it over.
-        if (hy > c + 1 && hy > depth * 0.6) return -2;
-      } else if (bb > 0 && 2 * (a + bb) <= zipLen + 2) { // soft sides give a little
-        q.setFromAxisAngle(Z, Math.PI / 2); hx = a + bb; hy = a; // lying along the zip
-      } else { hx = a; hy = a + bb; }
-      q.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler((Math.random() - 0.5) * 0.1, 0, (Math.random() - 0.5) * 0.1)));
-      const free = Math.max(0, (zs.x1 - zs.x0) / 2 - hx - 1);
-      // Pick the lowest free spot along the zip, packing from one end so the next item
-      // still fits beside it. Never spawn inside something already in the bag (the
-      // solver would fling both): if it's full, drop it clear above the opening.
-      // All of the above is in the bag's rest shape, but the simulated bag shifts and
-      // turns as it slumps: map each spot to where that part of the bag is now.
-      const cloth = this.cloth;
-      const now = (rx: number, ry: number) => cloth.toCurrent(new THREE.Vector3(rx, ry, zc));
-      const mid = (zs.x0 + zs.x1) / 2;
-      let at = now(mid, b[1]), best = Infinity, top = -Infinity;
-      for (let k = 0; k < 13; k++) {
-        const p = now(mid + free * (k / 6 - 1), b[1]);
-        const t = this.items.topNear(p.x, hx + 0.3);
-        const score = Math.max(t, -1e3) + k * 0.05; // ties → leftmost
-        if (score < best) { best = score; top = t; at = p; }
-      }
-      // Rest it just above the fabric actually under it (the bottom panel is thick
-      // and sags): spawning inside the fabric lets an item burrow under and lever the bag.
-      const ground = cloth.floorUnder(at.x - hx, at.x + hx, at.z, at.y + 4); // bottom panel band only
-      // Not dropped from the opening: a long fall tunnels straight through the fabric.
-      let y = (ground > -1e9 ? ground : at.y) + 0.8 + hy + 0.6;
-      if (top + 0.5 > y - hy) y = top + hy + 0.5;
-      // No room left below the opening: dropping it on the pile just knocks things out.
-      if (y + hy > now(mid, zs.y).y + 0.5) return -1; // must fit wholly below the opening
-      this.items.add(key, new THREE.Vector3(at.x, y, at.z), q.premultiply(cloth.fitQ));
-    } else {
-      const spread = (b[3] - b[0]) * 0.25;
-      const top = this.cloth.bodyBox()[4]; // body, not the strap high above it
-      this.items.add(key, new THREE.Vector3((Math.random() - 0.5) * spread, top + 8 + this.items.count * 2, 0));
+    const n = this.place(key);
+    if (n > 0) { this.syncBasket(); this.moving = true; this.invalidate(true); this.emitItems(); }
+    return n;
+  }
+  private fillToken = 0;
+  /** Keep adding the same thing, one by one, until the bag is full. Resolves with how many went in. */
+  async fillWith(key: string, max = 150) {
+    const tok = ++this.fillToken;
+    let n = 0;
+    while (n < max && tok === this.fillToken && this.cloth) {
+      const r = await this.addItem(key);
+      if (r <= 0) break;
+      n++;
+      await new Promise((res) => setTimeout(res, n < 12 ? 90 : 35));
     }
+    return n;
+  }
+  /** Take one item out. */
+  removeItem(id: string) {
+    this.items?.remove(id);
+    this.invalidate(true);
+    this.emitItems();
+  }
+  /** Empty the bag and put everything back, heaviest first, so the load sits low and balanced. */
+  repack() {
+    if (!this.items?.count) return;
+    const keys = this.items.list().sort((a, b) => b.mass - a.mass).map((x) => x.key);
+    this.items.clear();
+    for (const k of keys) this.place(k);
+    this.syncBasket();
     this.moving = true;
     this.invalidate(true);
-    return this.items.count;
+    this.emitItems();
+  }
+  get contents() { return this.items?.list() ?? []; }
+  get loadGrams() { return this.items?.totalMass ?? 0; }
+  /** Rough comfortable load for this fabric (g). */
+  get capacityGrams() {
+    return ({ canvas: 8000, denim: 9000, suede: 4000, leather: 7000, nylon: 10000 } as Record<string, number>)[this.finish.outer] ?? 6000;
   }
   clearItems() {
+    this.fillToken++;
     this.items?.clear();
     this.invalidate();
+    this.emitItems();
   }
 
-  /** Drag the bag while physics is on. Orbit still works when you miss the bag. */
+  /** Grab fabric / items / the zipper pull while the simulation runs. Orbit still works when you miss. */
   private initPointer(el: HTMLElement) {
     const ndc = new THREE.Vector2();
     const hitPoint = new THREE.Vector3();
@@ -650,7 +873,7 @@ export class Studio {
       this.ray.setFromCamera(ndc, this.camera);
     };
     // Capture phase: runs before OrbitControls' own pointerdown on the same element.
-    // Whichever simulation is active; cloth works in bag-local cm, rigid physics in world metres.
+    // The cloth simulation works in bag-local cm.
     type Handler = {
       holding: boolean;
       grab: (p: THREE.Vector3, obj: THREE.Object3D) => void;
@@ -669,8 +892,7 @@ export class Studio {
           release: () => { c.release(); it?.release(); },
         };
       }
-      const ph = this.physicsOn ? this.physics : null;
-      return ph && { holding: ph.holding, grab: (p) => ph.grab(p), drag: (p) => ph.drag(p), release: () => ph.release() };
+      return null;
     };
     let zipClick: { x: number; y: number; was: number } | null = null;
     el.addEventListener('pointerdown', (e) => {
@@ -781,6 +1003,7 @@ export class Studio {
   async setPathTracing(on: boolean) {
     if (on) await this.ensurePathTracer();
     this.pathTracing = on;
+    this.updateHandleVisibility();
     // The path tracer lights the scene with the environment, so it needs a brighter studio.
     this.scene.environmentIntensity = on ? 1.1 : 0.55;
     if (on) {
@@ -794,9 +1017,13 @@ export class Studio {
 
   screenshot(): string {
     // No preserveDrawingBuffer (faster), so draw and read back in the same task.
+    const hv = this.hgroup.visible;
+    this.hgroup.visible = false;
     if (this.pathTracing && this.pt) this.pt.renderSample();
     else this.composer.render();
-    return this.renderer.domElement.toDataURL('image/png');
+    const url = this.renderer.domElement.toDataURL('image/png');
+    this.hgroup.visible = hv;
+    return url;
   }
 
   async exportGLB(): Promise<ArrayBuffer> {

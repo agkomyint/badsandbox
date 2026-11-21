@@ -7,7 +7,8 @@ import RAPIER from '@dimforge/rapier3d-compat';
 import * as THREE from 'three';
 
 type Kind = 'box' | 'capsule';
-type Spec = {
+export type Spec = {
+  upright?: boolean; // wants to stand (bottles)
   label: string;
   kind: Kind;
   size: [number, number, number]; // box: half extents. capsule: [radius, half height, 0]
@@ -20,13 +21,19 @@ type Spec = {
 export const ITEMS: Record<string, Spec> = {
   phone: { label: 'Phone', kind: 'box', size: [3.7, 7.6, 0.42], mass: 200, color: '#1c1d21', roughness: 0.18, metalness: 0.3 },
   wallet: { label: 'Wallet', kind: 'box', size: [5.5, 4.4, 1.0], mass: 150, color: '#6b3d22', roughness: 0.55 },
-  bottle: { label: 'Bottle', kind: 'capsule', size: [3.3, 7.5, 0], mass: 500, color: '#3f7f86', roughness: 0.3, metalness: 0.6 },
+  bottle: { upright: true, label: 'Bottle', kind: 'capsule', size: [3.3, 7.5, 0], mass: 500, color: '#3f7f86', roughness: 0.3, metalness: 0.6 },
   book: { label: 'Notebook', kind: 'box', size: [7.4, 10.5, 0.8], mass: 350, color: '#c9b48a', roughness: 0.8 },
   case: { label: 'Glasses case', kind: 'capsule', size: [2.4, 5.2, 0], mass: 90, color: '#2b3a55', roughness: 0.5 },
+  tablet: { label: 'Tablet', kind: 'box', size: [8.5, 12, 0.4], mass: 480, color: '#9aa1ab', roughness: 0.25, metalness: 0.6 },
+  laptop: { label: 'Laptop', kind: 'box', size: [16, 11, 1.0], mass: 1300, color: '#6c7078', roughness: 0.3, metalness: 0.7 },
+  can: { label: 'Soda can', kind: 'capsule', size: [3.3, 2.8, 0], mass: 370, color: '#c0392b', roughness: 0.25, metalness: 0.8 },
   apple: { label: 'Apple', kind: 'capsule', size: [4.0, 0, 0], mass: 180, color: '#b8322a', roughness: 0.35 },
 };
 
 type Item = {
+  key: string;
+  inside?: boolean; // currently belongs to the bag: it can never leave it unless you pull it out
+  slot?: { lo: [number, number, number]; hi: [number, number, number] }; // reserved space in the bag's rest frame
   spec: Spec;
   body: RAPIER.RigidBody;
   mesh: THREE.Mesh;
@@ -84,7 +91,7 @@ export class Items {
    * Drop a new item from `at` (bag-local cm). `q` sets its orientation (items are
    * modelled long side along y, thin side along z); default is a random tumble.
    */
-  add(key: string, at: THREE.Vector3, q?: THREE.Quaternion) {
+  add(key: string, at: THREE.Vector3, q?: THREE.Quaternion, slot?: Item['slot']): THREE.Mesh | undefined {
     const spec = ITEMS[key];
     if (!spec) return;
     q ??= new THREE.Quaternion().setFromEuler(
@@ -116,12 +123,104 @@ export class Items {
     this.group.add(mesh);
     const reach = spec.kind === 'box' ? Math.hypot(a, b, c) : a + b;
     const item: Item = {
-      spec, body, mesh, pos: new THREE.Vector3(), rot: new Float32Array(9), reach,
+      key, slot, spec, body, mesh, pos: new THREE.Vector3(), rot: new Float32Array(9), reach,
       imp: new THREE.Vector3(), hits: 0,
     };
     mesh.userData.item = item;
     this.items.push(item);
     this.sync();
+    return mesh;
+  }
+
+  /** What is in the bag, in the order it went in. */
+  list() {
+    return this.items.map((it) => ({ id: it.mesh.uuid, key: it.key, label: it.spec.label, mass: it.spec.mass }));
+  }
+  get totalMass() {
+    return this.items.reduce((m, it) => m + it.spec.mass, 0);
+  }
+  slots() {
+    return this.items.filter((it) => it.slot).map((it) => ({ lo: it.slot!.lo, hi: it.slot!.hi, mass: it.spec.mass }));
+  }
+  remove(id: string) {
+    const k = this.items.findIndex((it) => it.mesh.uuid === id);
+    if (k < 0) return;
+    const it = this.items[k];
+    if (this.held === it) this.release();
+    this.world.removeRigidBody(it.body);
+    this.group.remove(it.mesh);
+    it.mesh.geometry.dispose();
+    (it.mesh.material as THREE.Material).dispose();
+    this.items.splice(k, 1);
+  }
+
+  /** Every way the item can sit, as [x, y, z] extents (cm) in the bag's frame plus the turn that gets it there. */
+  static orientations(spec: Spec) {
+    const [a, b, c] = spec.size;
+    const half: [number, number, number] = spec.kind === 'box' ? [a, b, c] : [a, a + b, a];
+    const out: { ext: [number, number, number]; q: THREE.Quaternion }[] = [];
+    const perms = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    for (const [i, j, k] of perms) {
+      // Column i of R is world x, column j world y, column k world z (flip one for a proper rotation).
+      const col = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+      col[i].set(1, 0, 0); col[j].set(0, 1, 0); col[k].set(0, 0, 1);
+      const m = new THREE.Matrix4().makeBasis(col[0], col[1], col[2]);
+      if (m.determinant() < 0) { col[k].multiplyScalar(-1); m.makeBasis(col[0], col[1], col[2]); }
+      out.push({ ext: [2 * half[i], 2 * half[j], 2 * half[k]], q: new THREE.Quaternion().setFromRotationMatrix(m) });
+    }
+    return out;
+  }
+
+  // ── The basket: invisible walls that follow the bag's inside so nothing can leave it ──
+  private basket?: { key: string; body: RAPIER.RigidBody; walls: RAPIER.Collider[]; lid: RAPIER.Collider; half: [number, number, number]; pc?: THREE.Vector3; pq?: THREE.Quaternion };
+  /** Place the walls (bag-local cm): centre, turn, half extents of the inside, and whether the zip is shut. */
+  setBasket(c: THREE.Vector3, q: THREE.Quaternion, half: [number, number, number], lid: boolean) {
+    const key = half.map((v) => v.toFixed(2)).join(',');
+    if (!this.basket || this.basket.key !== key) {
+      if (this.basket) this.world.removeRigidBody(this.basket.body);
+      const body = this.world.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(c.x, c.y, c.z).setRotation(q));
+      const [hw, hh, hd] = half, T = 3;
+      const mk = (hx: number, hy: number, hz: number, x: number, y: number, z: number) =>
+        this.world.createCollider(RAPIER.ColliderDesc.cuboid(hx, hy, hz).setTranslation(x, y, z).setFriction(0.3).setRestitution(0), body);
+      const walls = [
+        mk(T, hh + 6, hd + 2 * T, -(hw + T), 6, 0), mk(T, hh + 6, hd + 2 * T, hw + T, 6, 0),
+        mk(hw, hh + 6, T, 0, 6, -(hd + T)), mk(hw, hh + 6, T, 0, 6, hd + T),
+        // The bottom rides with the bag, so lifting it carries everything inside.
+        mk(hw + 2 * T, T, hd + 2 * T, 0, -hh - T, 0),
+      ];
+      const lidC = mk(hw + 2 * T, T, hd + 2 * T, 0, hh + T, 0);
+      this.basket = { key, body, walls, lid: lidC, half };
+    }
+    const { body, walls, lid: lidC } = this.basket;
+    // Carry what's inside along with the bag, exactly: lifting, swinging or tipping it moves the
+    // contents rigidly with it (collision alone can't keep up with a fast-moving bag).
+    const bk = this.basket;
+    if (bk.pc && bk.pq) {
+      const inv = bk.pq.clone().invert(), dq = q.clone().multiply(inv);
+      const [hw, hh, hd] = half;
+      for (const it of this.items) {
+        if (it === this.held) { it.inside = false; continue; }
+        const t = it.body.translation();
+        const l = new THREE.Vector3(t.x, t.y, t.z).sub(bk.pc).applyQuaternion(inv);
+        if (Math.abs(l.x) > hw + 1 || Math.abs(l.z) > hd + 1 || l.y < -hh - 2 || l.y > hh + 10) continue;
+        it.inside = true;
+        const np = l.applyQuaternion(q).add(c);
+        const r = it.body.rotation();
+        it.body.setTranslation(np, true);
+        it.body.setRotation(dq.clone().multiply(new THREE.Quaternion(r.x, r.y, r.z, r.w)), true);
+      }
+    }
+    bk.pc = c.clone(); bk.pq = q.clone();
+    // Let go of the walls while you hold something, so it can be pulled out of the bag.
+    const on = !this.held;
+    for (const w of walls) w.setEnabled(on);
+    lidC.setEnabled(on && lid);
+    body.setNextKinematicTranslation(c);
+    body.setNextKinematicRotation(q);
+  }
+  clearBasket() {
+    if (this.basket) this.world.removeRigidBody(this.basket.body);
+    this.basket = undefined;
   }
 
   clear() {
@@ -224,8 +323,27 @@ export class Items {
     const sub = dt > 1 / 70 ? 2 : 1;
     this.world.timestep = dt / sub;
     for (let s = 0; s < sub; s++) this.world.step();
+    this.keepInside();
     this.sync();
     return this.items.some((it) => !it.body.isSleeping()) || !!this.held;
+  }
+
+  /** Hard guarantee: whatever the bag does (shake, drop, flip), contents stay within its walls. */
+  private keepInside() {
+    const bk = this.basket;
+    if (!bk || !bk.pc || !bk.pq) return;
+    const inv = bk.pq.clone().invert(), [hw, hh, hd] = bk.half, m = 1.5;
+    for (const it of this.items) {
+      if (!it.inside || it === this.held) continue;
+      const t = it.body.translation();
+      const l = new THREE.Vector3(t.x, t.y, t.z).sub(bk.pc).applyQuaternion(inv);
+      const cx = Math.min(Math.max(l.x, -hw + m), hw - m), cy = Math.min(Math.max(l.y, -hh + m), hh - m), cz = Math.min(Math.max(l.z, -hd + m), hd - m);
+      if (cx === l.x && cy === l.y && cz === l.z) continue;
+      const np = new THREE.Vector3(cx, cy, cz).applyQuaternion(bk.pq).add(bk.pc);
+      it.body.setTranslation(np, true);
+      const v = it.body.linvel();
+      it.body.setLinvel({ x: v.x * 0.5, y: v.y * 0.5, z: v.z * 0.5 }, true);
+    }
   }
 
   private sync() {

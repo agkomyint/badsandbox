@@ -6,7 +6,7 @@ import type { Appearance, Design, Finish, Output, ParamValue, Surface } from './
 
 export type Slot = 'outer' | 'lining' | 'strap' | 'trim';
 export type Tab = 'pattern' | 'info';
-export type View = { pathTracing: boolean; stitches: boolean; turntable: boolean; physics: boolean; simulation: boolean; tab: Tab };
+export type View = { pathTracing: boolean; stitches: boolean; turntable: boolean; simulation: boolean; tab: Tab };
 
 export type State = {
   design: Design;
@@ -51,7 +51,7 @@ export function createAppStore(defaults: Design) {
             design: structuredClone(defaults),
             output: null,
             error: null,
-            view: { pathTracing: false, stitches: true, turntable: false, physics: false, simulation: false, tab: 'pattern' },
+            view: { pathTracing: false, stitches: true, turntable: false, simulation: false, tab: 'pattern' },
 
             setName: (name) => design((d) => ({ ...d, name })),
             setParam: (key, value) => design((d) => ({ ...d, params: { ...d.params, [key]: value } })),

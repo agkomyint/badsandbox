@@ -140,6 +140,12 @@ function section(title: string, closed = false): [HTMLElement, HTMLElement] {
  * Builds the left panel once. Inputs dispatch store actions; each input subscribes
  * to exactly its own slice of state, so reset/load/randomize/presets update it in place.
  */
+/** Slider range for a numeric param (used to clamp drag handles). */
+export function rangeOf(key: string): { min: number; max: number; step: number } | null {
+  for (const g of TOTE_SCHEMA) for (const f of g.fields) if (f.key === key && "min" in f) return f;
+  return null;
+}
+
 export function buildControls(root: HTMLElement, store: AppStore) {
   root.innerHTML = '';
   const act = () => store.getState();

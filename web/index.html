@@ -44,15 +44,16 @@
         <div id="boot-msg">loading engine…</div>
       </div>
     </div>
-    <div class="grid h-full grid-cols-[300px_1fr_360px] max-lg:grid-cols-[260px_1fr] max-md:grid-cols-1 max-md:grid-rows-[auto_60vh_auto]">
+    <div id="shell" class="grid h-full max-md:grid-rows-[auto_60vh_auto]">
       <!-- Left: design controls -->
-      <aside class="flex min-h-0 flex-col overflow-y-auto border-r border-white/5 bg-stone-900/60">
+      <aside id="left" class="flex min-h-0 flex-col border-r border-white/5 bg-stone-900/60">
         <header class="flex items-center gap-3 border-b border-white/5 px-4 py-4">
           <div class="grid size-9 place-items-center rounded-lg bg-accent/15 text-lg text-accent">◐</div>
-          <div>
+          <div class="brand">
             <div class="text-sm font-semibold tracking-tight text-stone-50">Bag Studio</div>
             <div class="text-[11px] text-stone-500">parametric bag engine</div>
           </div>
+          <button id="collapse" class="btn ml-auto px-2" title="Minimize the parameter panel" aria-expanded="true" aria-controls="controls">«</button>
         </header>
         <div class="space-y-2.5 border-b border-white/5 px-4 py-3">
           <label class="flex items-center justify-between gap-3 text-xs text-stone-400">
@@ -73,66 +74,99 @@
             <button id="reset" class="btn flex-1">Reset</button>
           </div>
         </div>
-        <div id="controls"></div>
+        <div id="controls" class="min-h-0 flex-1 overflow-y-auto"></div>
+        <div class="space-y-1.5 shrink-0 border-t border-white/5 bg-stone-900 p-2">
+          <div class="flex gap-1.5">
+            <select id="pattern-format" class="input min-w-0 flex-1" title="Pattern format">
+              <option value="a4">Pattern · A4 PDF</option>
+              <option value="letter">Pattern · Letter PDF</option>
+              <option value="full">Pattern · Full-size PDF</option>
+              <option value="svg">Pattern · SVG</option>
+            </select>
+            <button id="download-pattern" class="btn btn-primary">Download</button>
+          </div>
+          <div class="flex gap-1.5 text-[11px] [&>button]:flex-1">
+            <button id="save" class="btn" title="Save design as JSON">Save</button>
+            <button id="load" class="btn" title="Open a saved design">Open</button>
+            <button id="glb" class="btn" title="Download 3D model (GLB)">3D .glb</button>
+            <button id="obj" class="btn" title="Download 3D model (OBJ)">3D .obj</button>
+          </div>
+          <input id="file" type="file" accept=".json" hidden />
+        </div>
       </aside>
+
+      <!-- Middle: interactive pattern (left of the 3D view) -->
+      <aside id="right" class="relative flex min-h-0 flex-col border-r border-white/5 bg-stone-900/60 max-lg:col-span-2 max-md:col-span-1">
+        <div id="splitter" role="separator" aria-orientation="vertical" aria-label="Resize the pattern panel" tabindex="0" title="Drag to resize · double-click to reset"></div>
+        <div class="flex gap-1 border-b border-white/5 px-2 py-1">
+          <button data-tab="pattern" class="btn on flex-1 !py-0.5 text-[11px]">Pattern</button>
+          <button data-tab="info" class="btn flex-1 !py-0.5 text-[11px]">Cut list &amp; steps</button>
+        </div>
+        <div class="min-h-0 flex-1 overflow-y-auto p-2">
+          <div id="tab-pattern" class="tab h-full min-h-[360px]"><div class="flex h-full flex-col gap-1.5">
+            <div id="layers" class="flex gap-0.5 overflow-x-auto pb-0.5 text-[10px] [scrollbar-width:none] [&>button]:!px-1.5 [&>button]:!py-0.5"></div>
+            <div class="relative min-h-0 flex-1">
+              <div id="pattern" class="absolute inset-0"></div>
+              <button id="fit" class="btn absolute top-2 right-2 px-2 py-1 text-[11px]" title="Fit all pieces (double-click empty space)">Fit</button>
+              <div class="pointer-events-none absolute top-2 left-2 text-[10px] text-stone-600">scroll to zoom · drag to pan · click a piece for details</div>
+              <div id="piece-card" class="absolute right-2 bottom-2 left-2 hidden max-h-[45%] overflow-y-auto rounded-lg border border-white/10 bg-stone-950/90 p-2.5 text-xs text-stone-400 shadow-xl"></div>
+            </div>
+          </div></div>
+          <div id="tab-info" class="tab hidden">
+            <div id="info" class="text-xs [&_span]:text-stone-500 [&_table]:w-full [&_td]:border-b [&_td]:border-white/5 [&_td]:py-2 [&_td]:align-top [&_td:last-child]:text-right [&_td:last-child]:text-accent [&_h4]:mt-4 [&_h4]:mb-1.5 [&_h4]:text-[10px] [&_h4]:font-semibold [&_h4]:tracking-widest [&_h4]:text-stone-500 [&_h4]:uppercase [&_ol]:list-decimal [&_ul]:list-disc [&_ol]:pl-4 [&_ul]:pl-4 [&_li]:py-0.5 [&_li]:leading-snug [&_li]:text-stone-300"></div>
+          </div>
+        </div>
+        <div id="warnings" class="space-y-1 px-3 text-[11px] text-amber-400 empty:hidden"></div>
+      </aside>
+
 
       <!-- Center: 3D viewport -->
       <main class="relative min-h-0">
         <div id="viewport" class="absolute inset-0"></div>
-        <div class="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-xl border border-white/10 bg-stone-950/70 p-1.5 shadow-2xl backdrop-blur">
+        <div class="absolute bottom-4 left-1/2 flex max-w-[calc(100%-24px)] -translate-x-1/2 flex-wrap items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-stone-950/90 p-1.5 shadow-2xl">
           <button id="pt" class="btn" title="Progressive path tracing">✦ Ray trace</button>
           <button id="seams" class="btn on">Stitches</button>
           <button id="spin" class="btn">Turntable</button>
-          <button id="phys" class="btn" title="Gravity: drag the bag to pick it up, let go to drop it">Physics</button>
+          <button id="fitbtn" class="btn" title="Pick what you carry and see if it fits this bag">Fit check</button>
           <button id="sim" class="btn" title="Fabric simulation: the bag slumps and drapes like real cloth; drag any point to lift it">Simulation</button>
           <button id="frame" class="btn">Reset view</button>
           <button id="shot" class="btn">Screenshot</button>
         </div>
-        <div id="tray" class="absolute bottom-[68px] left-1/2 hidden -translate-x-1/2 items-center gap-1 rounded-xl border border-white/10 bg-stone-950/70 p-1.5 text-[11px] shadow-2xl backdrop-blur max-md:max-w-[calc(100%-32px)] max-md:flex-wrap max-md:justify-center">
-          <span class="px-1.5 text-stone-500">Drop in:</span>
+        <div id="tray" class="absolute bottom-[104px] left-1/2 hidden max-w-[calc(100%-24px)] -translate-x-1/2 flex-wrap items-center justify-center gap-1 rounded-xl border border-white/10 bg-stone-950/90 p-1.5 text-[11px] shadow-2xl max-md:max-w-[calc(100%-32px)] max-md:flex-wrap max-md:justify-center">
+          <span class="whitespace-nowrap px-1.5 text-stone-500">Add:</span>
           <button data-item="phone" class="btn">Phone</button>
           <button data-item="wallet" class="btn">Wallet</button>
           <button data-item="bottle" class="btn">Bottle</button>
           <button data-item="book" class="btn">Notebook</button>
           <button data-item="case" class="btn">Glasses case</button>
           <button data-item="apple" class="btn">Apple</button>
+          <button data-item="tablet" class="btn">Tablet</button>
+          <button data-item="laptop" class="btn">Laptop</button>
+          <button data-item="can" class="btn">Soda can</button>
           <button id="clear-items" class="btn" title="Take everything out">Empty</button>
+          <button id="add-zip" class="btn hidden" title="This bag has no zip top: add one">+ Add zip top</button>
           <button id="zip" class="btn hidden" title="Or click the zipper pull (drag it to slide)">Open zip</button>
         </div>
-        <div id="status" class="absolute top-3 left-3 rounded-md bg-stone-950/60 px-2 py-1 font-mono text-[11px] text-stone-400 backdrop-blur empty:hidden"></div>
+        <div id="fitpanel" class="absolute top-3 right-3 hidden max-h-[calc(100%-110px)] w-[290px] overflow-y-auto rounded-xl border border-white/10 bg-stone-950/90 p-3 text-[12px] shadow-2xl max-md:w-[calc(100%-24px)]">
+          <div class="mb-2 flex items-center justify-between"><b class="text-stone-200">Will it fit?</b><button id="fit-x" class="btn">×</button></div>
+          <div id="fit-list" class="flex flex-col gap-1"></div>
+          <div class="mt-2 border-t border-white/10 pt-2 text-stone-400">Custom item (cm)
+            <div class="mt-1 flex items-center gap-1"><input id="cw" type="number" value="20" min="1" class="w-12 rounded bg-stone-800 px-1 py-0.5 text-stone-200"><input id="ch" type="number" value="30" min="1" class="w-12 rounded bg-stone-800 px-1 py-0.5 text-stone-200"><input id="cd" type="number" value="5" min="1" class="w-12 rounded bg-stone-800 px-1 py-0.5 text-stone-200"><button id="cadd" class="btn">Add</button></div></div>
+          <div id="fit-out" class="mt-2 flex flex-col gap-1 border-t border-white/10 pt-2"></div>
+        </div>
+        <div id="contents" class="absolute top-12 left-3 hidden max-h-[60%] w-[230px] flex-col gap-1 overflow-y-auto rounded-xl border border-white/10 bg-stone-950/90 p-3 text-[12px] text-stone-300 shadow-2xl">
+          <b class="text-stone-200">In the bag</b>
+          <div id="ct-list" class="flex flex-col gap-0.5"></div>
+          <div id="ct-load" class="text-stone-400"></div>
+          <div class="h-1.5 w-full overflow-hidden rounded bg-stone-800"><div id="ct-bar" class="h-full w-0 bg-emerald-500"></div></div>
+          <div class="mt-1 border-t border-white/10 pt-2 text-stone-400">How many fit?
+            <div class="mt-1 flex gap-1"><select id="fill-sel" class="min-w-0 flex-1 rounded bg-stone-800 px-1 py-1 text-stone-200"></select><button id="fill-go" class="btn">Fill</button></div>
+            <div id="fill-res" class="mt-1 text-stone-200"></div></div>
+          <button id="repack" class="btn mt-1" title="Empty and refill heaviest first so the load sits low">Pack heavy first</button>
+        </div>
+        <div id="status" class="absolute top-3 left-3 rounded-md bg-stone-950/85 px-2 py-1 font-mono text-[11px] text-stone-400 empty:hidden"></div>
       </main>
 
-      <!-- Right: pattern + exports -->
-      <aside class="flex min-h-0 flex-col border-l border-white/5 bg-stone-900/60 max-lg:col-span-2 max-md:col-span-1">
-        <div class="flex gap-1 border-b border-white/5 p-2">
-          <button data-tab="pattern" class="btn on flex-1">Pattern</button>
-          <button data-tab="info" class="btn flex-1">Cut list &amp; steps</button>
-        </div>
-        <div class="min-h-0 flex-1 overflow-y-auto p-3">
-          <div id="tab-pattern" class="tab"><div id="pattern"></div></div>
-          <div id="tab-info" class="tab hidden">
-            <div id="info" class="text-xs [&_span]:text-stone-500 [&_table]:w-full [&_td]:border-b [&_td]:border-white/5 [&_td]:py-2 [&_td]:align-top [&_td:last-child]:text-right [&_td:last-child]:text-accent [&_h4]:mt-4 [&_h4]:mb-1.5 [&_h4]:text-[10px] [&_h4]:font-semibold [&_h4]:tracking-widest [&_h4]:text-stone-500 [&_h4]:uppercase [&_ol]:list-decimal [&_ul]:list-disc [&_ol]:pl-4 [&_ul]:pl-4 [&_li]:py-0.5 [&_li]:leading-snug [&_li]:text-stone-300"></div>
-          </div>
-        </div>
-        <div id="warnings" class="space-y-1 px-3 text-[11px] text-amber-400 empty:hidden"></div>
-        <div class="space-y-2 border-t border-white/5 p-3">
-          <div class="text-[10px] font-semibold tracking-widest text-stone-500 uppercase">Export pattern</div>
-          <div class="grid grid-cols-2 gap-1.5">
-            <button data-pdf="a4" class="btn btn-primary">PDF · A4 tiled</button>
-            <button data-pdf="letter" class="btn">PDF · Letter</button>
-            <button data-pdf="full" class="btn">PDF · Full size</button>
-            <button id="svg" class="btn">SVG</button>
-          </div>
-          <div class="pt-1 text-[10px] font-semibold tracking-widest text-stone-500 uppercase">Design &amp; model</div>
-          <div class="grid grid-cols-4 gap-1.5">
-            <button id="save" class="btn">Save</button>
-            <button id="load" class="btn">Load</button>
-            <button id="glb" class="btn">GLB</button>
-            <button id="obj" class="btn">OBJ</button>
-          </div>
-          <input id="file" type="file" accept=".json" hidden />
-        </div>
-      </aside>
     </div>
   </body>
 </html>

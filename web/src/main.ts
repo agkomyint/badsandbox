@@ -17,6 +17,7 @@ const slug = (s: string) => s.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').r
 async function main() {
   const status = $('status');
   const studio = new Studio($('viewport'));
+  if (import.meta.env.DEV) (window as any).studio = studio;
   const engine = new Engine();
   const store = createAppStore(await engine.defaultDesign('tote'));
   const act = () => store.getState();
@@ -42,7 +43,9 @@ async function main() {
     if (!p) return;
     $('info').innerHTML = `<table>${p.pieces
       .map((x) => `<tr><td><b>${x.name}</b><br><span>${x.notes.join('<br>')}</span></td><td>${x.cut}</td></tr>`)
-      .join('')}</table>`;
+      .join('')}</table>`
+      + (p.supplies?.length ? `<h4>Supplies</h4><ul>${p.supplies.map((s) => `<li>${s}</li>`).join('')}</ul>` : '')
+      + (p.steps?.length ? `<h4>Sewing order</h4><ol>${p.steps.map((s) => `<li>${s.replace(/^\d+\.\s*/, '')}</li>`).join('')}</ol>` : '');
     $('warnings').innerHTML = p.warnings.map((w) => `<div>⚠ ${w}</div>`).join('');
   });
   watch((s) => s.error, (e) => e && (status.textContent = e));
@@ -67,8 +70,9 @@ async function main() {
   $('shot').onclick = () =>
     Object.assign(document.createElement('a'), { href: studio.screenshot(), download: `${slug(design().name)}.png` }).click();
 
+  const gpuNote = studio.weakGpu ? ` · ${studio.gpu} (integrated GPU, switch browser to NVIDIA/AMD for speed)` : ` · ${studio.gpu}`;
   studio.onSamples = (n) =>
-    (status.textContent = n < 1 ? 'compiling path tracer… (first run ~30 s)' : `ray tracing · ${n} samples`);
+    (status.textContent = (n < 1 ? 'compiling path tracer… (first run ~30 s)' : `ray tracing · ${n} samples`) + gpuNote);
   watch((s) => s.view.pathTracing, async (on) => {
     pt.classList.toggle('on', on);
     if (on) status.textContent = 'compiling path tracer…';
@@ -82,6 +86,67 @@ async function main() {
   });
   watch((s) => s.view.stitches, (on) => { seams.classList.toggle('on', on); studio.setStitches(on); });
   watch((s) => s.view.turntable, (on) => { spin.classList.toggle('on', on); studio.setTurntable(on); });
+
+  const phys = $('phys');
+  phys.onclick = () => act().setView({ physics: !act().view.physics });
+  studio.onPhysics = (st) => {
+    if (studio.pathTracing) status.textContent = st === 'moving' ? 'ray tracing paused while the bag moves' : 'bag settled · ray tracing resumed';
+  };
+  const sim = $('sim');
+  sim.onclick = () => act().setView({ simulation: !act().view.simulation });
+  // Simulation tray: drop things into the bag, open and close the zipper.
+  const tray = $('tray'), zip = $('zip');
+  const syncZip = () => {
+    zip.classList.toggle('hidden', !studio.hasZip);
+    zip.textContent = studio.zipper > 0.5 ? 'Open zip' : 'Close zip';
+  };
+  zip.onclick = () => {
+    studio.zipper = studio.zipper > 0.5 ? 0 : 1;
+    syncZip();
+  };
+  $('viewport').addEventListener('pointerup', () => requestAnimationFrame(syncZip));
+  studio.onZipToggle = (open) => {
+    syncZip();
+    status.textContent = open ? 'zip open · drop items in · click the pull to close' : 'zip closed · click the pull to open';
+  };
+  tray.querySelectorAll<HTMLButtonElement>('[data-item]').forEach((b) => {
+    b.onclick = async () => {
+      const n = await studio.addItem(b.dataset.item!);
+      const what = b.textContent!.toLowerCase();
+      if (n === -2) status.textContent = `the ${what} is too big for this bag · try a deeper one`;
+      else if (n < 0) status.textContent = `no room for the ${what} · drag something out or Empty`;
+      else if (n) status.textContent = `${n} item${n > 1 ? 's' : ''} in play · drag items around${studio.hasZip && studio.zipper > 0.5 ? ' · open the zip to get them inside' : ''}`;
+    };
+  });
+  $('clear-items').onclick = () => studio.clearItems();
+
+  watch((s) => s.view.simulation, (on) => {
+    sim.classList.toggle('on', on);
+    tray.classList.toggle('hidden', !on);
+    tray.classList.toggle('flex', on);
+    if (on) act().setView({ turntable: false, physics: false });
+    try {
+      studio.setSimulation(on);
+      syncZip();
+      if (on) status.textContent = `fabric simulation · drag the fabric to lift${studio.hasZip ? ' · click the zipper pull to open' : ''} · drop items in below`;
+    } catch (e) {
+      console.error(e);
+      status.textContent = `simulation failed: ${e}`;
+      act().setView({ simulation: false });
+    }
+  });
+  watch((s) => s.view.physics, async (on) => {
+    phys.classList.toggle('on', on);
+    if (on) act().setView({ turntable: false, simulation: false });
+    try {
+      await studio.setPhysics(on);
+      if (on) status.textContent = 'physics on · drag the bag to pick it up, release to drop';
+    } catch (e) {
+      console.error(e);
+      status.textContent = `physics unavailable: ${e}`;
+      act().setView({ physics: false });
+    }
+  });
 
   // ── Tabs ────────────────────────────────────────────────────────────────────
   document.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach((b) => {

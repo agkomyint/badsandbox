@@ -83,8 +83,21 @@
           <button id="pt" class="btn" title="Progressive path tracing">✦ Ray trace</button>
           <button id="seams" class="btn on">Stitches</button>
           <button id="spin" class="btn">Turntable</button>
+          <button id="phys" class="btn" title="Gravity: drag the bag to pick it up, let go to drop it">Physics</button>
+          <button id="sim" class="btn" title="Fabric simulation: the bag slumps and drapes like real cloth; drag any point to lift it">Simulation</button>
           <button id="frame" class="btn">Reset view</button>
           <button id="shot" class="btn">Screenshot</button>
+        </div>
+        <div id="tray" class="absolute bottom-[68px] left-1/2 hidden -translate-x-1/2 items-center gap-1 rounded-xl border border-white/10 bg-stone-950/70 p-1.5 text-[11px] shadow-2xl backdrop-blur max-md:max-w-[calc(100%-32px)] max-md:flex-wrap max-md:justify-center">
+          <span class="px-1.5 text-stone-500">Drop in:</span>
+          <button data-item="phone" class="btn">Phone</button>
+          <button data-item="wallet" class="btn">Wallet</button>
+          <button data-item="bottle" class="btn">Bottle</button>
+          <button data-item="book" class="btn">Notebook</button>
+          <button data-item="case" class="btn">Glasses case</button>
+          <button data-item="apple" class="btn">Apple</button>
+          <button id="clear-items" class="btn" title="Take everything out">Empty</button>
+          <button id="zip" class="btn hidden" title="Or click the zipper pull (drag it to slide)">Open zip</button>
         </div>
         <div id="status" class="absolute top-3 left-3 rounded-md bg-stone-950/60 px-2 py-1 font-mono text-[11px] text-stone-400 backdrop-blur empty:hidden"></div>
       </main>
@@ -93,12 +106,12 @@
       <aside class="flex min-h-0 flex-col border-l border-white/5 bg-stone-900/60 max-lg:col-span-2 max-md:col-span-1">
         <div class="flex gap-1 border-b border-white/5 p-2">
           <button data-tab="pattern" class="btn on flex-1">Pattern</button>
-          <button data-tab="info" class="btn flex-1">Cut list</button>
+          <button data-tab="info" class="btn flex-1">Cut list &amp; steps</button>
         </div>
         <div class="min-h-0 flex-1 overflow-y-auto p-3">
           <div id="tab-pattern" class="tab"><div id="pattern"></div></div>
           <div id="tab-info" class="tab hidden">
-            <div id="info" class="text-xs [&_span]:text-stone-500 [&_table]:w-full [&_td]:border-b [&_td]:border-white/5 [&_td]:py-2 [&_td]:align-top [&_td:last-child]:text-right [&_td:last-child]:text-accent"></div>
+            <div id="info" class="text-xs [&_span]:text-stone-500 [&_table]:w-full [&_td]:border-b [&_td]:border-white/5 [&_td]:py-2 [&_td]:align-top [&_td:last-child]:text-right [&_td:last-child]:text-accent [&_h4]:mt-4 [&_h4]:mb-1.5 [&_h4]:text-[10px] [&_h4]:font-semibold [&_h4]:tracking-widest [&_h4]:text-stone-500 [&_h4]:uppercase [&_ol]:list-decimal [&_ul]:list-disc [&_ol]:pl-4 [&_ul]:pl-4 [&_li]:py-0.5 [&_li]:leading-snug [&_li]:text-stone-300"></div>
           </div>
         </div>
         <div id="warnings" class="space-y-1 px-3 text-[11px] text-amber-400 empty:hidden"></div>

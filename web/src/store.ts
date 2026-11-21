@@ -2,11 +2,11 @@
 // with selectors, so e.g. a colour change never triggers a geometry rebuild.
 import { createStore } from 'zustand/vanilla';
 import { persist, subscribeWithSelector } from 'zustand/middleware';
-import type { Appearance, Design, Finish, Output, Surface } from './engine';
+import type { Appearance, Design, Finish, Output, ParamValue, Surface } from './engine';
 
-export type Slot = 'outer' | 'lining' | 'strap';
+export type Slot = 'outer' | 'lining' | 'strap' | 'trim';
 export type Tab = 'pattern' | 'info';
-export type View = { pathTracing: boolean; stitches: boolean; turntable: boolean; tab: Tab };
+export type View = { pathTracing: boolean; stitches: boolean; turntable: boolean; physics: boolean; simulation: boolean; tab: Tab };
 
 export type State = {
   design: Design;
@@ -15,7 +15,9 @@ export type State = {
   view: View;
 
   setName: (name: string) => void;
-  setParam: (key: string, value: number | boolean) => void;
+  setParam: (key: string, value: ParamValue) => void;
+  setAppearance: (patch: Partial<Appearance>) => void;
+  applyPreset: (name: string) => void;
   setSurface: (slot: Slot, patch: Partial<Surface>) => void;
   setThread: (color: string) => void;
   setPiping: (on: boolean) => void;
@@ -49,13 +51,23 @@ export function createAppStore(defaults: Design) {
             design: structuredClone(defaults),
             output: null,
             error: null,
-            view: { pathTracing: false, stitches: true, turntable: false, tab: 'pattern' },
+            view: { pathTracing: false, stitches: true, turntable: false, physics: false, simulation: false, tab: 'pattern' },
 
             setName: (name) => design((d) => ({ ...d, name })),
             setParam: (key, value) => design((d) => ({ ...d, params: { ...d.params, [key]: value } })),
             setSurface: (slot, patch) => app((a) => ({ ...a, [slot]: { ...a[slot], ...patch } })),
             setThread: (thread) => app((a) => ({ ...a, thread })),
             setPiping: (piping) => app((a) => ({ ...a, piping })),
+            setAppearance: (patch) => app((a) => ({ ...a, ...patch })),
+            applyPreset: (name) => {
+              const p = PRESETS.find((x) => x.name === name);
+              if (!p) return;
+              design((d) => ({
+                ...d,
+                params: { ...defaults.params, ...p.params },
+                appearance: { ...defaults.appearance, ...p.appearance } as Appearance,
+              }));
+            },
             randomize: () => design(randomized),
             reset: () => set({ design: structuredClone(defaults) }),
             load: (d) => set({ design: mergeDesign(defaults, d) }),
@@ -76,6 +88,46 @@ export function createAppStore(defaults: Design) {
 }
 
 export type AppStore = ReturnType<typeof createAppStore>;
+
+/** Starting points. Generic constructions only - no brand marks or trade dress. */
+export const PRESETS: { name: string; params: Design['params']; appearance: Partial<Appearance> }[] = [
+  { name: 'Classic tote', params: {}, appearance: {} },
+  {
+    name: 'Heritage tote',
+    params: {
+      width: 34, top_width: 40, height: 30, depth: 16, top_depth: 9, corner_radius: 2, softness: 0.8,
+      strap_length: 48, strap_width: 2.5, strap_spacing: 13, strap_attach: 4, handle_tabs: true,
+      pocket: false, base_height: 6, binding: 1.5, stripe: true, stripe_width: 4.5, stripe_x: 0, stripe_angle: 0,
+      shoulder_strap: true, shoulder_length: 115, shoulder_width: 3, lining: true,
+    },
+    appearance: {
+      outer: { finish: 'canvas', color: '#b9a47e' },
+      strap: { finish: 'leather', color: '#4a2a18' },
+      trim: { finish: 'leather', color: '#4a2a18' },
+      metal: 'gold',
+      stripe: { edge: '#1f2f4a', mid: '#efe6d2' },
+      piping: false,
+    },
+  },
+  {
+    name: 'Zip crossbody',
+    params: {
+      width: 26, top_width: 26, height: 20, depth: 8, corner_radius: 3, softness: 0.6,
+      strap_length: 30, strap_width: 2, strap_spacing: 10, strap_attach: 3,
+      pocket: false, zip_top: true, zip_type: 'metal', zip_gauge: 5, zip_pull: 'tassel',
+      zip_pocket: true, zip_pocket_length: 16, zip_pocket_angle: 18, zip_pocket_x: 0, zip_pocket_from_top: 9, zip_pocket_depth: 10,
+      shoulder_strap: true, shoulder_length: 120, shoulder_width: 2.5,
+    },
+    appearance: {
+      outer: { finish: 'leather', color: '#7a4a2a' },
+      strap: { finish: 'leather', color: '#7a4a2a' },
+      trim: { finish: 'leather', color: '#7a4a2a' },
+      metal: 'silver',
+      zipper: { tape: '#3a2416', teeth: '#3a2416' },
+      piping: false,
+    },
+  },
+];
 
 const rnd = (a: number, b: number, step = 0.5) => Math.round((a + Math.random() * (b - a)) / step) * step;
 const pick = <T,>(xs: T[]) => xs[Math.floor(Math.random() * xs.length)];

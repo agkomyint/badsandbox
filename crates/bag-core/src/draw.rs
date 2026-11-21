@@ -55,6 +55,29 @@ pub fn layout(pat: &Pattern) -> Drawing {
         ly += 0.8;
         prims.push(text(v2(m + 12.0, ly), 0.45, &format!("{} - {}", pc.name, pc.cut), false, false));
     }
+    ly += 1.4;
+    prims.push(text(v2(m + 12.0, ly), 0.6, "Sewing order", false, false));
+    for s in &pat.steps {
+        ly += 0.75;
+        prims.push(text(v2(m + 12.0, ly), 0.42, s, false, false));
+    }
+    if !pat.supplies.is_empty() {
+        ly += 1.4;
+        prims.push(text(v2(m + 12.0, ly), 0.6, "Supplies", false, false));
+        for s in &pat.supplies {
+            ly += 0.75;
+            prims.push(text(v2(m + 12.0, ly), 0.42, &format!("- {s}"), false, false));
+        }
+    }
+    ly += 0.6;
+    prims.push(text(
+        v2(m + 12.0, ly),
+        0.38,
+        "Short lines on the cut edge = notches (match them). Fine lines at corners = clips (cut after sewing, never past the stitch line).",
+        false,
+        false,
+    ));
+    let header_h = (sq + 10.0).max(ly + 0.5);
 
     let boxes: Vec<(f64, f64, f64, f64)> = pat
         .pieces
@@ -64,10 +87,11 @@ pub fn layout(pat: &Pattern) -> Drawing {
             (b.0 - 0.5, b.1 - 0.5, b.2 + 0.5, b.3 + 0.5)
         })
         .collect();
-    let sheet_w = boxes.iter().map(|b| b.2 - b.0 + 2.0 * m).fold(90.0, f64::max);
+    let text_w = pat.steps.iter().map(|s| s.chars().count() as f64 * 0.42 * 0.52).fold(0.0, f64::max) + m + 13.0;
+    let sheet_w = boxes.iter().map(|b| b.2 - b.0 + 2.0 * m).fold(90.0f64.max(text_w), f64::max);
     let mut order: Vec<usize> = (0..boxes.len()).collect();
     order.sort_by(|a, b| (boxes[*b].3 - boxes[*b].1).total_cmp(&(boxes[*a].3 - boxes[*a].1)));
-    let (mut x, mut y, mut row_h) = (m, sq + 10.0 + gap, 0.0f64);
+    let (mut x, mut y, mut row_h) = (m, header_h + gap, 0.0f64);
     for i in order {
         let b = boxes[i];
         let (w, h) = (b.2 - b.0, b.3 - b.1);
@@ -98,10 +122,16 @@ fn draw_piece(pc: &Piece, b: (f64, f64, f64, f64), ox: f64, oy: f64, out: &mut V
         out.push(Prim::Text { at: mid + v2(0.0, -0.25), size: 0.4, text: "FOLD".into(), center: true, vertical: false, gray: 0.3 });
     }
     for n in &pc.notches {
-        out.push(path(vec![tf(n.at), tf(n.at + n.dir * 0.8)], false, 0.06, None, 0.0));
+        out.push(path(vec![tf(n.at), tf(n.at + n.dir * n.depth)], false, 0.06, None, 0.0));
+    }
+    for n in &pc.clips {
+        out.push(path(vec![tf(n.at), tf(n.at + n.dir * n.depth)], false, 0.02, None, 0.25));
     }
     for mk in &pc.marks {
         out.push(path(tfa(mk), false, 0.025, Some(vec![0.25, 0.2]), 0.4));
+    }
+    for l in &pc.labels {
+        out.push(Prim::Text { at: tf(l.at), size: 0.4, text: l.text.clone(), center: true, vertical: l.vertical, gray: 0.15 });
     }
     let (ga, gb) = (tf(pc.grain[0]), tf(pc.grain[1]));
     let u = (gb - ga).norm();

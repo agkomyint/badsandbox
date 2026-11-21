@@ -13,10 +13,23 @@ export type Mesh = { parts: Part[]; lines: Line[]; bounds: number[] };
 export type Piece = { id: string; name: string; cut: string; notes: string[] };
 export type Finish = 'canvas' | 'leather' | 'denim' | 'nylon' | 'suede';
 export type Surface = { finish: Finish; color: string };
-export type Appearance = { outer: Surface; lining: Surface; strap: Surface; thread: string; piping: boolean };
-export type Design = { style: string; name: string; params: Record<string, number | boolean>; appearance: Appearance };
-export type Pattern = { style: string; name: string; pieces: Piece[]; warnings: string[] };
-export type Output = { pattern: Pattern; params: Record<string, number | boolean>; svg: string; mesh: Mesh; ms: number };
+export type Metal = 'gold' | 'silver' | 'gunmetal' | 'black';
+export type Appearance = {
+  outer: Surface;
+  lining: Surface;
+  strap: Surface;
+  trim: Surface;
+  thread: string;
+  piping: boolean;
+  metal: Metal;
+  zipper: { tape: string; teeth: string };
+  stripe: { edge: string; mid: string };
+};
+export type ParamValue = number | boolean | string;
+export type Params = Record<string, ParamValue>;
+export type Design = { style: string; name: string; params: Params; appearance: Appearance };
+export type Pattern = { style: string; name: string; pieces: Piece[]; steps: string[]; supplies: string[]; warnings: string[] };
+export type Output = { pattern: Pattern; params: Params; svg: string; mesh: Mesh; ms: number };
 
 export class Engine {
   private worker = new Worker(new URL('./engine.worker.ts', import.meta.url), { type: 'module' });

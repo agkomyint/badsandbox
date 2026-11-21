@@ -176,6 +176,25 @@ export function makeMaterial(finish: Finish, color: string): THREE.MeshPhysicalM
   return m;
 }
 
+const METAL: Record<string, [string, number]> = {
+  gold: ['#d4a94f', 0.22],
+  silver: ['#d6d8dc', 0.18],
+  gunmetal: ['#55575c', 0.3],
+  black: ['#1c1c1e', 0.45],
+};
+
+/** Polished hardware. Pure metalness: the path tracer handles this natively. */
+export function metalMaterial(kind: string): THREE.MeshPhysicalMaterial {
+  const [color, roughness] = METAL[kind] ?? METAL.gold;
+  return new THREE.MeshPhysicalMaterial({ color, metalness: 1, roughness, side: THREE.DoubleSide });
+}
+
+/** Smooth plain-colour surfaces (zip tape, zip teeth, stripe webbing). */
+export function plainMaterial(color: string, roughness: number, sheen = 0): THREE.MeshPhysicalMaterial {
+  const c = new THREE.Color(color);
+  return new THREE.MeshPhysicalMaterial({ color: c, roughness, sheen, sheenRoughness: 0.5, sheenColor: c.clone(), side: THREE.DoubleSide });
+}
+
 export function threadMaterial(color: string) {
   return new THREE.MeshPhysicalMaterial({ color, roughness: 0.6, sheen: 0.8, sheenRoughness: 0.4, sheenColor: new THREE.Color(color) });
 }

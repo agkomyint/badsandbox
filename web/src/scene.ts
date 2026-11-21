@@ -15,11 +15,16 @@ import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import type { Appearance, Finish, Line, Mesh } from './engine';
-import { makeMaterial, threadMaterial } from './materials';
+import { makeMaterial, metalMaterial, plainMaterial, threadMaterial } from './materials';
+import { ClothSim } from './fabric';
+import { Items, ITEMS } from './items';
 
 const CM = 0.01; // engine works in cm, scene in metres
 const SETTLE_MS = 180; // idle time before AO kicks back in
-type Slot = 'outer' | 'lining' | 'strap';
+type Surf = 'outer' | 'lining' | 'strap' | 'trim';
+type Slot = Surf | 'metal' | 'zip_tape' | 'zip_teeth' | 'stripe_edge' | 'stripe_mid';
+const SURFS: Surf[] = ['outer', 'lining', 'strap', 'trim'];
+const SLOTS = new Set<string>([...SURFS, 'metal', 'zip_tape', 'zip_teeth', 'stripe_edge', 'stripe_mid']);
 
 /** Curved studio backdrop (floor sweeping up into a wall). */
 function cyclorama(width = 10, front = 5, back = 2.5, radius = 1.4, height = 5) {
@@ -168,8 +173,23 @@ export class Studio {
   controls: OrbitControls;
   composer: EffectComposer;
   bag = new THREE.Group();
+  /** Physics moves this; `bag` sits inside it with its bottom at y = 0. */
+  rig = new THREE.Group();
   onSamples: (n: number) => void = () => {};
+  onPhysics: (state: 'moving' | 'settled') => void = () => {};
+  /** Fired when a click on the zipper pull opens (true) or closes (false) the zip. */
+  onZipToggle?: (open: boolean) => void;
   pathTracing = false;
+
+  private physics: import('./physics').Physics | null = null;
+  private physicsOn = false;
+  private cloth: ClothSim | null = null;
+  private clothOn = false;
+  private items: Items | null = null;
+  private moving = false;
+  private lastT = performance.now();
+  private ray = new THREE.Raycaster();
+  private dragPlane = new THREE.Plane();
 
   private ao: GTAOPass;
   private meshes = new Map<string, THREE.Mesh>();
@@ -177,7 +197,8 @@ export class Studio {
   private stitches: THREE.Mesh;
   private mats: Record<Slot | 'piping', THREE.MeshPhysicalMaterial>;
   private thread: THREE.MeshPhysicalMaterial;
-  private finish: Record<Slot, Finish> = { outer: 'canvas', lining: 'canvas', strap: 'leather' };
+  private finish: Record<Surf, Finish> = { outer: 'canvas', lining: 'canvas', strap: 'leather', trim: 'leather' };
+  private metal = 'gold';
   private lastMesh: Mesh | null = null;
   private framed = false;
 
@@ -231,13 +252,21 @@ export class Studio {
 
     const stage = new THREE.Mesh(cyclorama(), new THREE.MeshStandardMaterial({ color: '#e4e0da', roughness: 0.95 }));
     stage.receiveShadow = true;
-    this.scene.add(stage, this.bag);
+    this.rig.add(this.bag);
+    this.scene.add(stage, this.rig);
+    this.initPointer(r.domElement);
     this.bag.scale.setScalar(CM);
 
     this.mats = {
       outer: makeMaterial('canvas', '#cdbb9f'),
       lining: makeMaterial('canvas', '#7d2c26'),
       strap: makeMaterial('leather', '#6a3a1e'),
+      trim: makeMaterial('leather', '#6a3a1e'),
+      metal: metalMaterial('gold'),
+      zip_tape: plainMaterial('#2b2622', 0.85, 0.6),
+      zip_teeth: plainMaterial('#2b2622', 0.35),
+      stripe_edge: makeMaterial('canvas', '#1f2f4a'),
+      stripe_mid: makeMaterial('canvas', '#efe6d2'),
       piping: makeMaterial('canvas', '#cdbb9f'),
     };
     this.thread = threadMaterial('#f1e7d4');
@@ -259,6 +288,20 @@ export class Studio {
     r.setAnimationLoop(() => this.frame());
   }
 
+  /** The GPU the browser gave us, e.g. "NVIDIA GeForce RTX 3060" or "Intel(R) UHD Graphics". */
+  get gpu(): string {
+    const gl = this.renderer.getContext();
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    const raw = ext ? String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : 'unknown GPU';
+    // "ANGLE (Intel, Intel(R) UHD Graphics (0x00009A60) Direct3D11 ...)" -> "Intel(R) UHD Graphics"
+    return raw.match(/ANGLE \([^,]+, ([^(,]+)/)?.[1]?.trim() ?? raw;
+  }
+
+  /** True when running on an integrated / software GPU, where path tracing is slow or unreliable. */
+  get weakGpu(): boolean {
+    return /intel|swiftshader|llvmpipe|basic render|microsoft/i.test(this.gpu);
+  }
+
   /** Request a redraw. `moving` = this change is part of an ongoing interaction. */
   invalidate(moving = false) {
     this.dirty = true;
@@ -277,8 +320,31 @@ export class Studio {
   }
 
   private frame() {
+    const now = performance.now();
+    const dt = (now - this.lastT) / 1000;
+    this.lastT = now;
     this.controls.update();
-    if (this.pathTracing && this.pt) {
+    const sim = this.clothOn ? this.cloth : this.physicsOn ? this.physics : null;
+    if (sim) {
+      let moving = sim.step(dt);
+      if (this.clothOn && this.items?.count) {
+        const g = this.items.group;
+        g.position.copy(this.bag.position);
+        g.scale.copy(this.bag.scale);
+        moving = this.items.step(dt) || moving;
+      }
+      if (moving) {
+        this.shadowDirty = true;
+        this.invalidate(true);
+      }
+      if (moving !== this.moving) {
+        this.moving = moving;
+        this.onPhysics(moving ? 'moving' : 'settled');
+        // Path tracing can't keep up with motion: raster while moving, re-trace once settled.
+        if (!moving && this.pathTracing) this.pt?.setScene(this.scene, this.camera);
+      }
+    }
+    if (this.pathTracing && this.pt && !this.moving) {
       this.pt.renderSample();
       this.onSamples(Math.floor(this.pt.samples));
       return;
@@ -299,7 +365,7 @@ export class Studio {
   }
 
   private slotOf(material: string): Slot {
-    return material === 'lining' || material === 'strap' ? material : 'outer';
+    return (SLOTS.has(material) ? material : 'outer') as Slot; // 'pocket' etc. use the outer fabric
   }
 
   /** Swap in new geometry. Meshes are reused by part name; old buffers are disposed. */
@@ -351,9 +417,12 @@ export class Studio {
 
     this.bag.position.y = -mesh.bounds[1] * CM;
     this.lastMesh = mesh;
+    this.physics?.setShape(this.bag);
+    if (this.clothOn) this.startCloth();
     if (!this.framed) {
       this.framed = true;
       this.frameView();
+      this.warmPathTracer();
     }
     this.shadowDirty = true;
     this.invalidate(true);
@@ -362,14 +431,31 @@ export class Studio {
 
   /** Colour changes are in-place; only a finish change creates a new material. */
   setAppearance(app: Appearance) {
-    for (const slot of ['outer', 'lining', 'strap'] as const) {
+    const swap = (slot: Slot, mat: THREE.MeshPhysicalMaterial) => {
+      const old = this.mats[slot];
+      this.mats[slot] = mat;
+      for (const m of this.meshes.values()) if (m.userData.slot === slot) m.material = mat;
+      old.dispose();
+    };
+    const metal = app.metal ?? 'gold';
+    if (metal !== this.metal) {
+      this.metal = metal;
+      swap('metal', metalMaterial(metal));
+    }
+    if (app.zipper) {
+      recolor(this.mats.zip_tape, app.zipper.tape);
+      recolor(this.mats.zip_teeth, app.zipper.teeth);
+    }
+    if (app.stripe) {
+      recolor(this.mats.stripe_edge, app.stripe.edge);
+      recolor(this.mats.stripe_mid, app.stripe.mid);
+    }
+    for (const slot of SURFS) {
       const s = app[slot];
+      if (!s) continue;
       if (this.finish[slot] !== s.finish) {
-        const old = this.mats[slot];
-        this.mats[slot] = makeMaterial(s.finish, s.color);
+        swap(slot, makeMaterial(s.finish, s.color));
         this.finish[slot] = s.finish;
-        for (const m of this.meshes.values()) if (m.userData.slot === slot) m.material = this.mats[slot];
-        old.dispose();
         if (slot === 'outer') {
           const oldP = this.mats.piping;
           this.mats.piping = makeMaterial(s.finish, s.color);
@@ -409,6 +495,246 @@ export class Studio {
     this.invalidate(true);
   }
 
+  /** Gravity + floor + mouse pick-up. Turning it on drops the bag from a little height. */
+  async setPhysics(on: boolean) {
+    if (on && !this.physics) {
+      const { Physics } = await import('./physics');
+      this.physics = await Physics.create(this.rig);
+      this.physics.setShape(this.bag);
+    }
+    this.physicsOn = on;
+    if (!this.physics) return;
+    if (on) this.physics.reset(0.25);
+    else {
+      this.physics.reset(0);
+      this.moving = false;
+      this.onPhysics('settled');
+      if (this.pathTracing) this.pt?.setScene(this.scene, this.camera);
+    }
+    this.shadowDirty = true;
+    this.invalidate(true);
+  }
+
+  /** Soft-body fabric simulation: the bag slumps, drapes and can be lifted by any point. */
+  setSimulation(on: boolean) {
+    this.clothOn = on;
+    if (on) {
+      this.rig.position.set(0, 0, 0);
+      this.rig.quaternion.identity();
+      this.startCloth();
+    } else {
+      this.cloth?.restore();
+      this.cloth = null;
+      this.items?.clear();
+      this.moving = false;
+      this.onPhysics('settled');
+      if (this.pathTracing) this.pt?.setScene(this.scene, this.camera);
+    }
+    this.shadowDirty = true;
+    this.invalidate(true);
+  }
+
+  /** Number of fabric particles in the running simulation (0 when off). */
+  get clothParticles() {
+    return this.cloth?.n ?? 0;
+  }
+
+  private startCloth() {
+    const floor = this.lastMesh ? this.lastMesh.bounds[1] : 0;
+    this.cloth = new ClothSim(this.bag, floor, this.finish.outer);
+    this.cloth.items = this.items;
+    this.items?.setFloor(floor);
+    this.moving = true;
+    this.onPhysics('moving');
+  }
+
+  /** True if the simulated bag has a zip top you can open. */
+  get hasZip() {
+    return !!this.cloth?.hasZip;
+  }
+  /** Zip slider: 0 = open, 1 = closed (simulation only). */
+  get zipper() {
+    return this.cloth?.zipper ?? 1;
+  }
+  set zipper(s: number) {
+    if (!this.cloth) return;
+    this.cloth.zipper = s;
+    this.moving = true; // wake the loop: a settled bag isn't being stepped
+    this.invalidate(true);
+  }
+
+  /** Drop an item into (or onto) the bag. Simulation only. */
+  async addItem(key: string) {
+    if (!this.cloth || !this.lastMesh) return 0;
+    const b = this.lastMesh.bounds; // [minX, minY, minZ, maxX, maxY, maxZ] in cm
+    if (!this.items) {
+      this.items = await Items.create(b[1]);
+      this.rig.add(this.items.group);
+    }
+    if (!this.cloth) return 0; // turned off while Rapier was loading
+    this.cloth.items = this.items;
+    const spec = ITEMS[key];
+    // The way in: an open zip, or the whole top of a bag without one.
+    let zs = this.cloth.zipSpan;
+    if (zs && this.cloth.zipper > 0.5) zs = null; // zipped shut: it lands on top
+    else if (!zs) { const bb = this.cloth.bodyBox(); zs = { x0: bb[0] + 1.5, x1: bb[3] - 1.5, y: bb[4] }; }
+    if (zs && spec) {
+      // Pack it the way people do: long side along the zip, lying flat on the
+      // bottom if it fits across the gusset, else standing on its long edge. Standing
+      // things upright looked nice but they lean on a wall and lever a soft bag over.
+      const [a, bb, c] = spec.size;
+      // Depth where it'll lie: at the bottom (gussets often taper toward it).
+      const [z0, z1] = this.cloth.bodyDepth(b[1] - 1, b[1] + 3);
+      const zipLen = zs.x1 - zs.x0, depth = z1 - z0, zc = (z0 + z1) / 2;
+      const Z = new THREE.Vector3(0, 0, 1), X = new THREE.Vector3(1, 0, 0);
+      const q = new THREE.Quaternion();
+      let hx: number, hy: number;
+      if (spec.kind === 'box') {
+        const long = Math.max(a, bb), wide = Math.min(a, bb);
+        if (bb > a) q.setFromAxisAngle(Z, Math.PI / 2); // model's long axis (y) → x
+        if (2 * long > zipLen - 1) { q.identity(); hx = a; hy = bb; } // too long: upright
+        else if (2 * wide <= depth + 0.5) { q.premultiply(new THREE.Quaternion().setFromAxisAngle(X, Math.PI / 2)); hx = long; hy = c; }
+        else { hx = long; hy = wide; }
+        // A tall flat thing standing in a narrow bag leans on a wall and levers it over.
+        if (hy > c + 1 && hy > depth * 0.6) return -2;
+      } else if (bb > 0 && 2 * (a + bb) <= zipLen + 2) { // soft sides give a little
+        q.setFromAxisAngle(Z, Math.PI / 2); hx = a + bb; hy = a; // lying along the zip
+      } else { hx = a; hy = a + bb; }
+      q.multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler((Math.random() - 0.5) * 0.1, 0, (Math.random() - 0.5) * 0.1)));
+      const free = Math.max(0, (zs.x1 - zs.x0) / 2 - hx - 1);
+      // Pick the lowest free spot along the zip, packing from one end so the next item
+      // still fits beside it. Never spawn inside something already in the bag (the
+      // solver would fling both): if it's full, drop it clear above the opening.
+      // All of the above is in the bag's rest shape, but the simulated bag shifts and
+      // turns as it slumps: map each spot to where that part of the bag is now.
+      const cloth = this.cloth;
+      const now = (rx: number, ry: number) => cloth.toCurrent(new THREE.Vector3(rx, ry, zc));
+      const mid = (zs.x0 + zs.x1) / 2;
+      let at = now(mid, b[1]), best = Infinity, top = -Infinity;
+      for (let k = 0; k < 13; k++) {
+        const p = now(mid + free * (k / 6 - 1), b[1]);
+        const t = this.items.topNear(p.x, hx + 0.3);
+        const score = Math.max(t, -1e3) + k * 0.05; // ties → leftmost
+        if (score < best) { best = score; top = t; at = p; }
+      }
+      // Rest it just above the fabric actually under it (the bottom panel is thick
+      // and sags): spawning inside the fabric lets an item burrow under and lever the bag.
+      const ground = cloth.floorUnder(at.x - hx, at.x + hx, at.z, at.y + 4); // bottom panel band only
+      // Not dropped from the opening: a long fall tunnels straight through the fabric.
+      let y = (ground > -1e9 ? ground : at.y) + 0.8 + hy + 0.6;
+      if (top + 0.5 > y - hy) y = top + hy + 0.5;
+      // No room left below the opening: dropping it on the pile just knocks things out.
+      if (y + hy > now(mid, zs.y).y + 0.5) return -1; // must fit wholly below the opening
+      this.items.add(key, new THREE.Vector3(at.x, y, at.z), q.premultiply(cloth.fitQ));
+    } else {
+      const spread = (b[3] - b[0]) * 0.25;
+      const top = this.cloth.bodyBox()[4]; // body, not the strap high above it
+      this.items.add(key, new THREE.Vector3((Math.random() - 0.5) * spread, top + 8 + this.items.count * 2, 0));
+    }
+    this.moving = true;
+    this.invalidate(true);
+    return this.items.count;
+  }
+  clearItems() {
+    this.items?.clear();
+    this.invalidate();
+  }
+
+  /** Drag the bag while physics is on. Orbit still works when you miss the bag. */
+  private initPointer(el: HTMLElement) {
+    const ndc = new THREE.Vector2();
+    const hitPoint = new THREE.Vector3();
+    const aim = (e: PointerEvent) => {
+      const r = el.getBoundingClientRect();
+      ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+      this.ray.setFromCamera(ndc, this.camera);
+    };
+    // Capture phase: runs before OrbitControls' own pointerdown on the same element.
+    // Whichever simulation is active; cloth works in bag-local cm, rigid physics in world metres.
+    type Handler = {
+      holding: boolean;
+      grab: (p: THREE.Vector3, obj: THREE.Object3D) => void;
+      drag: (p: THREE.Vector3) => void;
+      release: () => void;
+    };
+    const active = (): Handler | null => {
+      if (this.clothOn && this.cloth) {
+        const c = this.cloth, it = this.items;
+        const local = (p: THREE.Vector3) => this.bag.worldToLocal(p.clone());
+        return {
+          holding: c.holding || !!it?.holding,
+          // An item, the zipper pull, or else the nearest bit of fabric.
+          grab: (p, obj) => { const l = local(p); if (!it?.grab(obj, l)) c.grab(l, obj.name); },
+          drag: (p) => (it?.holding ? it.drag(local(p)) : c.drag(local(p))),
+          release: () => { c.release(); it?.release(); },
+        };
+      }
+      const ph = this.physicsOn ? this.physics : null;
+      return ph && { holding: ph.holding, grab: (p) => ph.grab(p), drag: (p) => ph.drag(p), release: () => ph.release() };
+    };
+    let zipClick: { x: number; y: number; was: number } | null = null;
+    el.addEventListener('pointerdown', (e) => {
+      const sim = active();
+      if (!sim || e.button !== 0) return;
+      aim(e);
+      const hits = this.ray.intersectObject(this.rig, true);
+      // Things in a bag are mostly hidden under fabric: if the ray reaches an item just
+      // behind the first surface (through a thin wall or a half-open zip), take the item.
+      const ig = this.items?.group;
+      const reach = 12 * this.bag.scale.x; // 12 cm, in world units
+      // Same for the zipper pull, which the strap often lies across.
+      const near = (h: THREE.Intersection) => h.distance - (hits[0]?.distance ?? 0) < reach;
+      const itemHit = hits.find((h) => near(h) && /^zip_top_(slider|ring|tassel)/.test(h.object.name))
+        || (ig && hits.find((h) => near(h) && ig.children.includes(h.object)));
+      let hit = itemHit || hits[0];
+      // The pull is small: any click within ~28 px of it on screen counts as grabbing it.
+      if (this.clothOn && this.hasZip && !/^zip_top_(slider|ring|tassel)/.test(hit?.object.name ?? '')) {
+        let pull: THREE.Mesh | null = null;
+        this.bag.traverse((m) => { if (!pull && /^zip_top_slider/.test(m.name) && (m as THREE.Mesh).geometry) pull = m as THREE.Mesh; });
+        if (pull) {
+          const g = (pull as THREE.Mesh).geometry;
+          g.computeBoundingBox(); // vertices move with the cloth
+          const c = (pull as THREE.Mesh).localToWorld(g.boundingBox!.getCenter(new THREE.Vector3()));
+          const s = c.clone().project(this.camera), r = el.getBoundingClientRect();
+          const dx = r.left + (s.x + 1) / 2 * r.width - e.clientX, dy = r.top + (1 - s.y) / 2 * r.height - e.clientY;
+          if (dx * dx + dy * dy < 28 * 28) hit = { object: pull, point: c, distance: 0 } as THREE.Intersection;
+        }
+      }
+      if (!hit) return;
+      this.controls.enabled = false;
+      el.setPointerCapture(e.pointerId);
+      // Drag on a vertical plane facing the camera through the grab point.
+      const n = this.camera.getWorldDirection(new THREE.Vector3()).setY(0).normalize();
+      this.dragPlane.setFromNormalAndCoplanarPoint(n, hit.point);
+      sim.grab(hit.point, hit.object);
+      // A click (no drag) on the pull toggles the zip open/closed; a drag slides it.
+      zipClick = this.clothOn && /^zip_top_(slider|ring|tassel)/.test(hit.object.name)
+        ? { x: e.clientX, y: e.clientY, was: this.zipper } : null;
+      el.style.cursor = 'grabbing';
+    }, { capture: true });
+    el.addEventListener('pointermove', (e) => {
+      const sim = active();
+      if (!sim?.holding) return;
+      aim(e);
+      if (this.ray.ray.intersectPlane(this.dragPlane, hitPoint)) sim.drag(hitPoint);
+    });
+    const up = (e: PointerEvent) => {
+      const sim = active();
+      if (!sim?.holding) return;
+      sim.release();
+      if (zipClick && Math.hypot(e.clientX - zipClick.x, e.clientY - zipClick.y) < 6) {
+        this.zipper = zipClick.was > 0.5 ? 0 : 1;
+        this.onZipToggle?.(this.zipper < 0.5);
+      }
+      zipClick = null;
+      this.controls.enabled = true;
+      el.releasePointerCapture?.(e.pointerId);
+      el.style.cursor = '';
+    };
+    el.addEventListener('pointerup', up);
+    el.addEventListener('pointercancel', up);
+  }
+
   /** BVH rebuilds are expensive: coalesce bursts of edits into one. */
   private schedulePathTracerRebuild() {
     if (!this.pathTracing) return;
@@ -416,15 +742,44 @@ export class Studio {
     this.ptTimer = window.setTimeout(() => this.pt?.setScene(this.scene, this.camera), 250);
   }
 
+  private async ensurePathTracer() {
+    if (this.pt) return;
+    this.ptMod ??= await import('three-gpu-pathtracer');
+    if (this.pt) return; // another caller won the race
+    this.pt = new this.ptMod.WebGLPathTracer(this.renderer);
+    // Set everything that changes shader defines *before* the first compile.
+    this.pt.minSamples = 1;
+    this.pt.bounces = 6;
+    this.pt.filterGlossyFactor = 0.5;
+    this.pt.dynamicLowRes = true;
+  }
+
+  /**
+   * Compile the path-tracing shader in the background right after load, so the
+   * Ray trace button starts almost instantly instead of waiting ~30 s.
+   * Uses parallel (non-blocking) shader compilation; nothing is drawn.
+   */
+  private warmed = false;
+  private warmPathTracer() {
+    if (this.warmed) return;
+    this.warmed = true;
+    const idle = (window as any).requestIdleCallback ?? ((f: () => void) => setTimeout(f, 300));
+    idle(async () => {
+      try {
+        await this.ensurePathTracer();
+        if (this.pathTracing) return; // user already turned it on
+        this.pt.setScene(this.scene, this.camera);
+        const core = this.pt._pathTracer;
+        if (!this.pt.isCompiling) await core?.compileMaterial?.();
+        console.info('[studio] path tracer pre-compiled');
+      } catch (e) {
+        console.warn('[studio] path tracer warm-up failed', e);
+      }
+    });
+  }
+
   async setPathTracing(on: boolean) {
-    if (on && !this.pt) {
-      this.ptMod ??= await import('three-gpu-pathtracer');
-      this.pt = new this.ptMod.WebGLPathTracer(this.renderer);
-      this.pt.minSamples = 1;
-      this.pt.bounces = 6;
-      this.pt.filterGlossyFactor = 0.5;
-      this.pt.dynamicLowRes = true;
-    }
+    if (on) await this.ensurePathTracer();
     this.pathTracing = on;
     // The path tracer lights the scene with the environment, so it needs a brighter studio.
     this.scene.environmentIntensity = on ? 1.1 : 0.55;

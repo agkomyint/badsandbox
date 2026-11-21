@@ -4,6 +4,7 @@
 
 pub mod draw;
 pub mod geom;
+pub mod hardware;
 pub mod mesh;
 pub mod pattern;
 pub mod pdf;
@@ -44,8 +45,12 @@ pub fn default_appearance() -> Value {
         "outer":  { "finish": "canvas",  "color": "#cdbb9f" },
         "lining": { "finish": "canvas",  "color": "#7d2c26" },
         "strap":  { "finish": "leather", "color": "#6a3a1e" },
+        "trim":   { "finish": "leather", "color": "#6a3a1e" },
         "thread": "#f1e7d4",
-        "piping": true
+        "piping": true,
+        "metal": "gold",
+        "zipper": { "tape": "#2b2622", "teeth": "#2b2622" },
+        "stripe": { "edge": "#1f2f4a", "mid": "#efe6d2" }
     })
 }
 
@@ -74,10 +79,12 @@ pub fn generate(d: &Design) -> Result<Output, String> {
             let warnings = tote::sanitize(&mut p);
             let path = tote::outline(&p);
             let pieces = tote::pieces(&p, &path);
+            let steps = tote::steps(&p);
+            let supplies = tote::supplies(&p);
             let mesh = tote::mesh(&p, &path);
             let name = if d.name.is_empty() { "Tote".to_string() } else { d.name.clone() };
             Ok(Output {
-                pattern: pattern::Pattern { style: "tote".into(), name, pieces, warnings },
+                pattern: pattern::Pattern { style: "tote".into(), name, pieces, steps, supplies, warnings },
                 mesh,
                 params: serde_json::to_value(p).unwrap(),
             })
@@ -103,7 +110,9 @@ mod tests {
         let d = default_design("tote").unwrap();
         let out = generate(&d).unwrap();
         assert!(out.pattern.warnings.is_empty(), "{:?}", out.pattern.warnings);
-        assert_eq!(out.pattern.pieces.len(), 4);
+        // body, gusset, body lining, gusset lining, handle, pocket
+        assert_eq!(out.pattern.pieces.len(), 6);
+        assert!(!out.pattern.steps.is_empty());
         assert!(!out.mesh.parts.is_empty());
         let pdf = pattern_pdf(&out, Paper::A4);
         assert!(pdf.starts_with(b"%PDF-1.4"));

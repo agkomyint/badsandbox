@@ -112,8 +112,11 @@ pub fn render(d: &Drawing, paper: Paper) -> Vec<u8> {
             let (pw, ph) = paper.size();
             let foot = 0.8;
             let (tw, th) = (pw - 2.0 * m, ph - 2.0 * m - foot);
-            let cols = (d.w / tw).ceil().max(1.0) as usize;
-            let rows = (d.h / th).ceil().max(1.0) as usize;
+            // Pages overlap by `ov` so they can be glued with a margin for error.
+            let ov = 1.0;
+            let (sx, sy) = (tw - ov, th - ov);
+            let cols = ((d.w - ov) / sx).ceil().max(1.0) as usize;
+            let rows = ((d.h - ov) / sy).ceil().max(1.0) as usize;
             let name = |r: usize, c: usize| format!("{}{}", (b'A' + (r % 26) as u8) as char, c + 1);
             for r in 0..rows {
                 for c in 0..cols {
@@ -122,12 +125,40 @@ pub fn render(d: &Drawing, paper: Paper) -> Vec<u8> {
                     let mut s = format!(
                         "q {} {} {} {} re W n {} 0 0 {} {} {} cm /Fm1 Do Q\n",
                         f(x0), f(y0), f(w), f(h), f(K), f(-K),
-                        f((m - c as f64 * tw) * K),
-                        f((ph - m + r as f64 * th) * K)
+                        f((m - c as f64 * sx) * K),
+                        f((ph - m + r as f64 * sy) * K)
                     );
                     s += &format!("0.6 G 0.4 w [] 0 d {} {} {} {} re S\n", f(x0), f(y0), f(w), f(h));
+                    let o = ov * K;
+                    let cross = |s: &mut String, x: f64, y: f64| {
+                        *s += &format!("0 G 0.5 w [] 0 d {} {} m {} {} l S {} {} m {} {} l S\n", f(x - 6.0), f(y), f(x + 6.0), f(y), f(x), f(y - 6.0), f(x), f(y + 6.0));
+                    };
+                    if c + 1 < cols {
+                        let x = x0 + w - o;
+                        s += &format!("0.3 G 0.4 w [3 2] 0 d {} {} m {} {} l S\n", f(x), f(y0), f(x), f(y0 + h));
+                        for k in [0.25, 0.75] {
+                            cross(&mut s, x0 + w - o / 2.0, y0 + h * k);
+                        }
+                    }
+                    if c > 0 {
+                        for k in [0.25, 0.75] {
+                            cross(&mut s, x0 + o / 2.0, y0 + h * k);
+                        }
+                    }
+                    if r + 1 < rows {
+                        let y = y0 + o;
+                        s += &format!("0.3 G 0.4 w [3 2] 0 d {} {} m {} {} l S\n", f(x0), f(y), f(x0 + w), f(y));
+                        for k in [0.25, 0.75] {
+                            cross(&mut s, x0 + w * k, y0 + o / 2.0);
+                        }
+                    }
+                    if r > 0 {
+                        for k in [0.25, 0.75] {
+                            cross(&mut s, x0 + w * k, y0 + h - o / 2.0);
+                        }
+                    }
                     let label = format!(
-                        "Page {} (row {}, col {}) of {}x{} | {} | print at 100%, trim on the border, butt pages together",
+                        "Page {} (row {}, col {}) of {}x{} | {} | print at 100% | trim this page's left/top border, lay it on the dashed line of the page before, match the + marks, tape",
                         name(r, c), r + 1, c + 1, rows, cols, d.title
                     );
                     s += &format!("BT 0 g /F1 7 Tf {} {} Td ({}) Tj ET\n", f(m * K), f(0.45 * K), esc(&label));

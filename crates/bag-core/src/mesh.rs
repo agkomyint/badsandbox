@@ -184,6 +184,82 @@ impl Part {
         self.uvs.extend(&o.uvs);
         self.indices.extend(o.indices.iter().map(|i| i + base));
     }
+
+    /// Append an oriented box (flat shaded). `ax` are unit axes, `he` half extents.
+    pub fn push_box(&mut self, c: V3, ax: [V3; 3], he: [f64; 3]) {
+        for k in 0..3 {
+            for s in [-1.0, 1.0] {
+                let n = ax[k] * s;
+                let (u, v) = (ax[(k + 1) % 3] * he[(k + 1) % 3], ax[(k + 2) % 3] * he[(k + 2) % 3]);
+                let f = c + n * he[k];
+                let base = self.vcount() as u32;
+                for (a, b) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                    self.positions.extend((f + u * a + v * b).arr());
+                    self.normals.extend(n.arr());
+                    self.uvs.extend([a as f32 * 0.5, b as f32 * 0.5]);
+                }
+                let q = if s > 0.0 { [0, 1, 2, 0, 2, 3] } else { [0, 2, 1, 0, 3, 2] };
+                self.indices.extend(q.iter().map(|i| base + i));
+            }
+        }
+    }
+
+    /// Round tube along `pts` (closed loops repeat their first point at the end).
+    pub fn tube(name: &str, material: &str, pts: &[V3], r: f64, sides: usize) -> Part {
+        let fr = frames(pts);
+        Part::grid(
+            name,
+            material,
+            pts.len(),
+            sides + 1,
+            |i, j| {
+                let a = 2.0 * std::f64::consts::PI * j as f64 / sides as f64;
+                let (_, n, b) = fr[i];
+                (pts[i] + n * (r * a.cos()) + b * (r * a.sin()), [i as f64 * 0.2, j as f64 / sides as f64])
+            },
+            |i, _, p| p - pts[i],
+        )
+    }
+
+    /// Flat strap with rounded edges. `wdir` = across the width, `tdir` = through the thickness.
+    pub fn strap(name: &str, material: &str, c: &[V3], wdir: &[V3], tdir: &[V3], w: f64, t: f64) -> Part {
+        let mut sc = vec![0.0];
+        for p in c.windows(2) {
+            let last = *sc.last().unwrap();
+            sc.push(last + (p[1] - p[0]).len());
+        }
+        let prof = 18;
+        let spow = |v: f64, e: f64| v.signum() * v.abs().powf(e);
+        Part::grid(
+            name,
+            material,
+            c.len(),
+            prof + 1,
+            |i, j| {
+                let th = 2.0 * std::f64::consts::PI * j as f64 / prof as f64;
+                let px = spow(th.cos(), 0.34) * w / 2.0;
+                let py = spow(th.sin(), 0.34) * t / 2.0;
+                (c[i] + wdir[i] * px + tdir[i] * py, [sc[i], px])
+            },
+            |i, _, p| p - c[i],
+        )
+    }
+}
+
+/// Rotation-minimising frames (tangent, normal, binormal) along a polyline.
+pub fn frames(pts: &[V3]) -> Vec<(V3, V3, V3)> {
+    let n = pts.len();
+    let tan = |i: usize| (pts[(i + 1).min(n - 1)] - pts[i.saturating_sub(1)]).norm();
+    let t0 = tan(0);
+    let seed = if t0.y.abs() < 0.9 { v3(0.0, 1.0, 0.0) } else { v3(1.0, 0.0, 0.0) };
+    let mut nrm = (seed - t0 * seed.dot(t0)).norm();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = tan(i);
+        nrm = (nrm - t * nrm.dot(t)).norm();
+        out.push((t, nrm, t.cross(nrm)));
+    }
+    out
 }
 
 /// A polyline drawn as geometry: `piping` is a seam bead, `stitch` is dashed thread.
